@@ -27,7 +27,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,8 +59,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -86,6 +91,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Ensure dark status bar icons on white top bar and proper system window insets
+        runCatching {
+            WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = true
+                isAppearanceLightNavigationBars = true
+            }
+        }
 
         // Restore any previously picked SAF URIs + scan accessible phone directories for real .gguf files
         restoreAndScanLocalGgufFiles()
@@ -491,6 +504,7 @@ fun PocketGgufAppShell(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .statusBarsPadding()
                         .padding(horizontal = 16.dp, vertical = 12.dp)
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -498,7 +512,9 @@ fun PocketGgufAppShell(
                             text = "PocketGGUF",
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF0F172A)
+                            color = Color(0xFF0F172A),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                         Text(
                             text = when {
@@ -509,6 +525,8 @@ fun PocketGgufAppShell(
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             color = when {
                                 !state.hasValidModelMounted -> Color(0xFFDC2626)
                                 state.serverRunning -> Color(0xFF15803D)
@@ -516,6 +534,8 @@ fun PocketGgufAppShell(
                             }
                         )
                     }
+
+                    Spacer(modifier = Modifier.width(12.dp))
 
                     Button(
                         onClick = { onToggleServer(!state.serverRunning) },
@@ -535,7 +555,8 @@ fun PocketGgufAppShell(
                                 else -> "Start Server"
                             },
                             fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1
                         )
                     }
                 }
@@ -543,7 +564,8 @@ fun PocketGgufAppShell(
         },
         bottomBar = {
             NavigationBar(
-                containerColor = Color.White
+                containerColor = Color.White,
+                modifier = Modifier.navigationBarsPadding()
             ) {
                 AppTab.entries.forEach { tab ->
                     NavigationBarItem(
@@ -1054,6 +1076,7 @@ fun ModelsVaultScreen(
                     Button(
                         onClick = onPickSafGguf,
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A)),
+                        shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
@@ -1066,18 +1089,21 @@ fun ModelsVaultScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = onPickSafFolder,
+                            shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Scan GGUF Folder", fontSize = 12.sp)
+                            Text("Scan GGUF Folder", fontSize = 12.sp, maxLines = 1)
                         }
                         OutlinedButton(
                             onClick = onRunSelfApiTest,
                             enabled = !selfTestLoading,
+                            shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.weight(1f)
                         ) {
                             Text(
                                 text = if (selfTestLoading) "Testing..." else "Self API Test",
-                                fontSize = 12.sp
+                                fontSize = 12.sp,
+                                maxLines = 1
                             )
                         }
                     }
@@ -1201,7 +1227,7 @@ fun ModelsVaultScreen(
                         color = Color(0xFF64748B)
                     )
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxWidth()
@@ -1211,17 +1237,26 @@ fun ModelsVaultScreen(
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = if (isActivelyServing) Color(0xFF16A34A) else Color(0xFF0F172A)
                             ),
+                            shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.weight(1f)
                         ) {
                             Text(
-                                text = if (isSelected) "Copy Client ID (\"${model.id}\")" else "Mount & Copy Client ID",
-                                fontSize = 11.sp
+                                text = when {
+                                    isActivelyServing -> "✓ Serving Live · Copy Client ID"
+                                    isSelected -> "Copy Client Model ID"
+                                    else -> "Mount & Copy Client ID"
+                                },
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                         OutlinedButton(
-                            onClick = { onRemoveModel(model) }
+                            onClick = { onRemoveModel(model) },
+                            shape = RoundedCornerShape(8.dp)
                         ) {
-                            Text("Remove", fontSize = 11.sp, color = Color(0xFFDC2626))
+                            Text("Remove", fontSize = 12.sp, color = Color(0xFFDC2626), maxLines = 1)
                         }
                     }
                 }
