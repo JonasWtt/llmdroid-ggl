@@ -1032,24 +1032,38 @@ fun PocketGgufAppShell(
     }
 }
 
+private var fallbackInProcessPfd: ParcelFileDescriptor? = null
+private var fallbackInProcessUri: String = ""
+
 /**
  * Ensures the native JNI model is loaded in-process if fallback inference is needed.
- * Uses the exact LlamaBridge.nativeLoadModel signature.
+ * Uses the exact LlamaBridge.nativeLoadModel signature and keeps the SAF ParcelFileDescriptor
+ * open while llama.cpp holds the mmap mapping.
  */
 private fun ensureInProcessJniModelLoaded(context: Context, state: EngineTelemetryState): Boolean {
     val active = state.activeModel
-    var safPfd: ParcelFileDescriptor? = null
     return try {
         val loadPath = if (active.uriString.startsWith("content://")) {
-            val uri = Uri.parse(active.uriString)
-            safPfd = context.contentResolver.openFileDescriptor(uri, "r")
-            if (safPfd != null) {
+            val existingPfd = fallbackInProcessPfd
+            if (fallbackInProcessUri == active.uriString && existingPfd != null) {
                 EngineStateRepository.update { it.copy(safDescriptorError = null) }
-                "/proc/self/fd/${safPfd!!.fd}"
+                "/proc/self/fd/${existingPfd.fd}"
             } else {
-                val msg = "ContentResolver.openFileDescriptor returned null for ${active.uriString}"
-                EngineStateRepository.update { it.copy(safDescriptorError = msg) }
-                return false
+                fallbackInProcessPfd?.close()
+                fallbackInProcessPfd = null
+                fallbackInProcessUri = ""
+                val uri = Uri.parse(active.uriString)
+                val openedPfd = context.contentResolver.openFileDescriptor(uri, "r")
+                if (openedPfd != null) {
+                    fallbackInProcessPfd = openedPfd
+                    fallbackInProcessUri = active.uriString
+                    EngineStateRepository.update { it.copy(safDescriptorError = null) }
+                    "/proc/self/fd/${openedPfd.fd}"
+                } else {
+                    val msg = "ContentResolver.openFileDescriptor returned null for ${active.uriString}"
+                    EngineStateRepository.update { it.copy(safDescriptorError = msg) }
+                    return false
+                }
             }
         } else {
             active.uriString.ifBlank { active.filename }
@@ -1073,8 +1087,6 @@ private fun ensureInProcessJniModelLoaded(context: Context, state: EngineTelemet
         EngineStateRepository.update { it.copy(safDescriptorError = errText) }
         EngineStateRepository.logDiagnostic("JNI_LOAD_ERR", "In-process JNI model load error: $errText")
         false
-    } finally {
-        runCatching { safPfd?.close() }
     }
 }
 
@@ -1125,8 +1137,8 @@ private suspend fun executeLocalSelfApiTest(
         val url = URL("http://127.0.0.1:${currentState.port}/v1/chat/completions")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 5000
-            readTimeout = 15000
+            connectTimeout = 10_000
+            readTimeout = 300_000
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Authorization", "Bearer ${currentState.bearerToken}")
@@ -2162,8 +2174,8 @@ private suspend fun executeLocalChatTurn(
         val url = URL("http://127.0.0.1:${liveState.port}/v1/chat/completions")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 5000
-            readTimeout = 30000
+            connectTimeout = 10_000
+            readTimeout = 300_000
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Authorization", "Bearer ${liveState.bearerToken}")

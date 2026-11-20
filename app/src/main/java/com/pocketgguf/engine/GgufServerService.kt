@@ -34,6 +34,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
 import kotlin.math.roundToInt
+import org.json.JSONObject
 
 /**
  * Headless Android Foreground Service hosting a dependency-free OpenAI-compatible HTTP server
@@ -42,11 +43,13 @@ import kotlin.math.roundToInt
 class GgufServerService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val jniLoadLock = Any()
     private var serverSocket: ServerSocket? = null
     private var acceptJob: Job? = null
     private var telemetryJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var activeModelPfd: ParcelFileDescriptor? = null
+    private var activeModelUri: String = ""
     private var lastLoadedSignature: String = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -93,12 +96,20 @@ class GgufServerService : Service() {
 
     private fun resolveNativePathOrFd(uriString: String): String? {
         if (uriString.startsWith("content://")) {
+            val existingPfd = activeModelPfd
+            if (activeModelUri == uriString && existingPfd != null) {
+                EngineStateRepository.update { it.copy(safDescriptorError = null) }
+                return "/proc/self/fd/${existingPfd.fd}"
+            }
             return try {
                 activeModelPfd?.close()
+                activeModelPfd = null
+                activeModelUri = ""
                 val uri = Uri.parse(uriString)
                 val pfd = contentResolver.openFileDescriptor(uri, "r")
                 if (pfd != null) {
                     activeModelPfd = pfd
+                    activeModelUri = uriString
                     val fdPath = "/proc/self/fd/${pfd.fd}"
                     val statMb = if (pfd.statSize > 0) pfd.statSize / (1024 * 1024) else -1L
                     EngineStateRepository.update { it.copy(safDescriptorError = null) }
@@ -124,14 +135,15 @@ class GgufServerService : Service() {
         return uriString
     }
 
-    private fun ensureActiveModelLoadedInJni(state: EngineTelemetryState): Boolean {
+    private fun ensureActiveModelLoadedInJni(state: EngineTelemetryState): Boolean = synchronized(jniLoadLock) {
         if (!state.hasValidModelMounted) {
             EngineStateRepository.logDiagnostic("WARN", "ensureActiveModelLoadedInJni skipped: no valid model mounted")
             return false
         }
 
+        val currentState = EngineStateRepository.state.value
         val targetSignature = "${state.activeModel.uriString}|${state.contextLength}|${state.kvCacheQuant}|${state.mmapEnabled}"
-        if (lastLoadedSignature == targetSignature && state.jniLoadRc == 0 && state.safDescriptorError == null) {
+        if (lastLoadedSignature == targetSignature && currentState.jniLoadRc == 0 && currentState.safDescriptorError == null) {
             return true
         }
 
@@ -139,7 +151,7 @@ class GgufServerService : Service() {
 
         EngineStateRepository.logDiagnostic(
             "JNI_LOAD",
-            "Loading model '${state.activeModel.id}' via descriptor=$nativePath, n_ctx=${state.contextLength}, kv=${state.kvCacheQuant}"
+            "Loading model '${state.activeModel.id}' into llama.cpp via descriptor=$nativePath, n_ctx=${state.contextLength}, kv=${state.kvCacheQuant}"
         )
 
         val rc = LlamaBridge.nativeLoadModel(
@@ -186,13 +198,12 @@ class GgufServerService : Service() {
                 return@launch
             }
 
-            ensureActiveModelLoadedInJni(state)
-
             var boundSocket: ServerSocket? = null
             var actualPort = requestedPort
             var lastBindErr: Exception? = null
 
-            // Try requested port first, and auto-heal to requestedPort+1 or +2 if occupied
+            // Bind ServerSocket immediately first so HTTP loopback clients never get Connection Refused
+            // while multi-gigabyte GGUF tensors are being memory-mapped by llama.cpp.
             for (candidatePort in listOf(requestedPort, requestedPort + 1, requestedPort + 2)) {
                 try {
                     val inetAddress = InetAddress.getByName(bindHost)
@@ -236,6 +247,11 @@ class GgufServerService : Service() {
                 "HTTP_BIND",
                 "ServerSocket listening on http://$bindHost:$actualPort/v1 (model=${state.activeModel.id})"
             )
+
+            // Warm-load the GGUF model into llama.cpp in background
+            launch {
+                runCatching { ensureActiveModelLoadedInJni(state) }
+            }
 
             try {
                 while (isActive && serverSocket?.isClosed == false) {
@@ -282,7 +298,7 @@ class GgufServerService : Service() {
 
     private fun handleClientSocket(socket: Socket) {
         socket.use { client ->
-            client.soTimeout = 30_000
+            client.soTimeout = 300_000
             val clientIp = client.inetAddress?.hostAddress ?: "127.0.0.1"
             val input = BufferedInputStream(client.getInputStream())
             val writer = PrintWriter(OutputStreamWriter(client.getOutputStream(), Charsets.UTF_8), true)
@@ -412,24 +428,36 @@ class GgufServerService : Service() {
                         )
                         val jniElapsed = System.currentTimeMillis() - t0
 
+                        val usageObj = runCatching { JSONObject(responseJson).optJSONObject("usage") }.getOrNull()
+                        val actualPromptTokens = usageObj?.optInt("prompt_tokens", 0) ?: 0
+                        val actualCompletionTokens = usageObj?.optInt("completion_tokens", 0) ?: 0
+                        val actualReusedPrefix = usageObj?.optInt("prefix_cache_reused_tokens", reusedPrefix) ?: reusedPrefix
+                        val actualPpTps = usageObj?.optDouble("prompt_eval_tps", 0.0) ?: 0.0
+                        val actualTgTps = usageObj?.optDouble("eval_tps", 0.0) ?: 0.0
+
                         writeHttpResponse(writer, 200, "OK", responseJson)
                         EngineStateRepository.logDiagnostic(
                             "HTTP_200",
-                            "Served $path in ${jniElapsed}ms (model=${postLoadState.activeModel.id}, gbnf=$enforceJson)"
+                            "Served $path in ${jniElapsed}ms (model=${postLoadState.activeModel.id}, prompt=$actualPromptTokens tok, gen=$actualCompletionTokens tok @ ${"%.1f".format(actualTgTps)} t/s)"
                         )
                         EngineStateRepository.update {
-                            it.copy(totalRequestsServed = it.totalRequestsServed + 1)
+                            it.copy(
+                                totalRequestsServed = it.totalRequestsServed + 1,
+                                lastReusedPrefixTokens = actualReusedPrefix,
+                                promptEvalTps = actualPpTps,
+                                tokenGenTps = actualTgTps
+                            )
                         }
                         recordAudit(
                             method = method,
                             endpoint = path,
                             clientIp = clientIp,
                             status = 200,
-                            reason = "OK (KV=${postLoadState.kvCacheQuant}, n_keep=$reusedPrefix tok, GBNF=$enforceJson)",
-                            promptTokens = 148,
-                            completionTokens = 64,
-                            tps = 31.2,
-                            reusedPrefix = reusedPrefix,
+                            reason = "OK (KV=${postLoadState.kvCacheQuant}, n_keep=$actualReusedPrefix tok, ${"%.1f".format(actualTgTps)} t/s)",
+                            promptTokens = actualPromptTokens,
+                            completionTokens = actualCompletionTokens,
+                            tps = actualTgTps,
+                            reusedPrefix = actualReusedPrefix,
                             gbnfApplied = enforceJson
                         )
                     } finally {
