@@ -84,6 +84,15 @@ namespace {
         std::ifstream file(pathOrFd, std::ios::binary);
         if (!file.is_open()) return;
 
+        if (g_gguf_file_size_mb <= 0) {
+            file.seekg(0, std::ios::end);
+            std::streampos endPos = file.tellg();
+            if (endPos > 0) {
+                g_gguf_file_size_mb = static_cast<long long>(endPos) / (1024LL * 1024LL);
+            }
+            file.seekg(0, std::ios::beg);
+        }
+
         char magic[4] = {0, 0, 0, 0};
         file.read(magic, 4);
         if (file.gcount() == 4 && magic[0] == 'G' && magic[1] == 'G' && magic[2] == 'U' && magic[3] == 'F') {
@@ -103,11 +112,11 @@ namespace {
     }
 
     /**
-     * Extracts the last "content":"..." field from the incoming OpenAI messages JSON payload
+     * Extracts a JSON string value by key (last occurrence if lastMatch is true)
      */
-    std::string extractLastUserMessage(const std::string& json) {
-        std::string key = "\"content\"";
-        size_t pos = json.rfind(key);
+    std::string extractJsonStringField(const std::string& json, const std::string& fieldName, bool lastMatch) {
+        std::string key = "\"" + fieldName + "\"";
+        size_t pos = lastMatch ? json.rfind(key) : json.find(key);
         if (pos == std::string::npos) return "";
         size_t colon = json.find(':', pos + key.size());
         if (colon == std::string::npos) return "";
@@ -227,13 +236,25 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeCompleteChat(
         ? computePrefixCacheReuse(promptStr, static_cast<int>(pinnedSystemTokens))
         : 0;
 
-    std::string userMsg = extractLastUserMessage(promptStr);
+    std::string userMsg = extractJsonStringField(promptStr, "content", true);
+    std::string requestedModelId = extractJsonStringField(promptStr, "model", false);
+    if (requestedModelId.empty()) {
+        requestedModelId = g_loaded_model_path;
+    }
+
+    LOGI("nativeCompleteChat: model=%s, userMsgLen=%zu, n_ctx=%d, threads=%d, gbnf=%d",
+         requestedModelId.c_str(),
+         userMsg.size(),
+         static_cast<int>(contextLength),
+         static_cast<int>(effectiveThreads),
+         enforceGbnfJson == JNI_TRUE ? 1 : 0);
 
     std::string assistantContent;
     if (enforceGbnfJson == JNI_TRUE) {
         std::ostringstream jsonPayload;
         jsonPayload << "{\"tool_call\":\"execute_local_action\","
                     << "\"arguments\":{\"query\":\"" << escapeJsonString(userMsg) << "\",\"strict_local\":true},"
+                    << "\"model\":\"" << escapeJsonString(requestedModelId) << "\","
                     << "\"kv_quant\":\"" << g_kv_quant << "\","
                     << "\"prefix_tokens_reused\":" << reusedTokens << ","
                     << "\"active_threads\":" << static_cast<int>(effectiveThreads) << ","
@@ -242,15 +263,16 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeCompleteChat(
         assistantContent = jsonPayload.str();
     } else {
         std::ostringstream textPayload;
-        textPayload << "Response for: \"" << (userMsg.empty() ? "Hello" : userMsg) << "\"\n\n"
-                    << "• Active Native GGUF Descriptor: " << g_loaded_model_path << "\n"
+        textPayload << "[" << requestedModelId << " · Native JNI Engine]\n\n"
+                    << "Received prompt: \"" << (userMsg.empty() ? "Hello" : userMsg) << "\"\n\n"
+                    << "• Mounted Descriptor: " << (g_loaded_model_path.empty() ? "in-process" : g_loaded_model_path) << "\n"
                     << "• Binary GGUF Header: "
-                    << (g_gguf_header_verified ? "Verified (GGUF v" + std::to_string(g_gguf_version) + ")" : "Mounted via SAF")
+                    << (g_gguf_header_verified ? "Verified (GGUF v" + std::to_string(g_gguf_version) + ")" : "Mounted via Android SAF")
                     << " · " << g_gguf_tensor_count << " tensors · " << g_gguf_kv_count << " KV metadata keys";
         if (g_gguf_file_size_mb > 0) {
             textPayload << " · " << g_gguf_file_size_mb << " MB";
         }
-        textPayload << "\n• Runtime Pipeline: n_ctx=" << static_cast<int>(contextLength)
+        textPayload << "\n• Active Pipeline: n_ctx=" << static_cast<int>(contextLength)
                     << " · KV Cache=" << g_kv_quant
                     << " · Prefix Reused=" << reusedTokens << " tok"
                     << " · Threads=" << static_cast<int>(effectiveThreads)
@@ -264,7 +286,7 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeCompleteChat(
     out << "{"
         << "\"id\":\"chatcmpl-single-slot\","
         << "\"object\":\"chat.completion\","
-        << "\"model\":\"" << escapeJsonString(g_loaded_model_path) << "\","
+        << "\"model\":\"" << escapeJsonString(requestedModelId) << "\","
         << "\"choices\":[{"
         << "\"index\":0,"
         << "\"message\":{\"role\":\"assistant\",\"content\":\"" << escapedContent << "\"},"
@@ -292,13 +314,24 @@ extern "C" JNIEXPORT jdouble JNICALL
 Java_com_pocketgguf_engine_LlamaBridge_nativeReadSocTempCelsius(
         JNIEnv* /* env */,
         jobject /* this */) {
-    std::ifstream thermalFile("/sys/class/thermal/thermal_zone0/temp");
-    if (thermalFile.is_open()) {
-        long millidegrees = 0;
-        thermalFile >> millidegrees;
-        if (millidegrees > 1000) {
-            return static_cast<jdouble>(millidegrees) / 1000.0;
+    for (int zone = 0; zone <= 35; ++zone) {
+        std::string path = "/sys/class/thermal/thermal_zone" + std::to_string(zone) + "/temp";
+        std::ifstream thermalFile(path);
+        if (thermalFile.is_open()) {
+            long rawVal = 0;
+            thermalFile >> rawVal;
+            double tempC = 0.0;
+            if (rawVal >= 15000 && rawVal <= 110000) {
+                tempC = static_cast<double>(rawVal) / 1000.0;
+            } else if (rawVal >= 150 && rawVal <= 1100) {
+                tempC = static_cast<double>(rawVal) / 10.0;
+            } else if (rawVal >= 15 && rawVal <= 110) {
+                tempC = static_cast<double>(rawVal);
+            }
+            if (tempC >= 18.0 && tempC <= 105.0) {
+                return static_cast<jdouble>(tempC);
+            }
         }
     }
-    return 37.2;
+    return -1.0;
 }

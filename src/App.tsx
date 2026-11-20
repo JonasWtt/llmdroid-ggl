@@ -315,6 +315,15 @@ export default function App() {
     const t0 = Date.now();
 
     try {
+      if (!serverRunning) {
+        setServerRunning(true);
+        await fetch('/api/engine/toggle-server', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ running: true }),
+        });
+      }
+
       const apiMessages = nextHistory
         .filter((m) => !m.isError)
         .slice(-12)

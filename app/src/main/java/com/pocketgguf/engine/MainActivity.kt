@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -47,6 +48,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -65,6 +67,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -84,11 +88,10 @@ import java.nio.ByteOrder
  * Features:
  *  - Real Android Storage Access Framework (SAF) file picker (`OpenDocument`) & folder scanner (`OpenDocumentTree`)
  *  - Reads real DISPLAY_NAME, real byte size via `OpenableColumns`, and binary `GGUF` magic header (0x47475546)
- *  - No fake pre-installed model stubs: only displays real `.gguf` files picked or discovered on the user's phone
- *  - Persists selected `.gguf` URIs across app restarts in `SharedPreferences`
- *  - Long-Press (or tap) on any model card mounts it AND copies its OpenAI client `model` ID to the Android Clipboard
- *  - Unambiguous status indicator showing `SERVING LIVE ON :8080` vs `MOUNTED IN STANDBY (SERVER STOPPED)`
- *  - Self API Functionality Test button that sends a live local HTTP POST to `/v1/chat/completions`
+ *  - Real hardware temperature & RAM polling every 2 seconds via `GgufServerService.sampleDeviceHardwareSensors`
+ *  - Auto-starts `GgufServerService` when a `.gguf` file is selected or when a chat message is sent
+ *  - Includes direct JNI fallback in chat if loopback HTTP socket is unavailable
+ *  - Built-in expandable & 1-tap copyable Diagnostic Log viewer inside Chat and API Bridge tabs
  */
 class MainActivity : ComponentActivity() {
 
@@ -103,6 +106,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Sample real device temperature and RAM immediately on launch
+        GgufServerService.sampleDeviceHardwareSensors(this)
+        EngineStateRepository.logDiagnostic("APP", "MainActivity onCreate · sampling real device sensors")
+
         // Restore any previously picked SAF URIs + scan accessible phone directories for real .gguf files
         restoreAndScanLocalGgufFiles()
 
@@ -110,6 +117,14 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 val telemetry by EngineStateRepository.state.collectAsState()
                 val context = LocalContext.current
+
+                // Continuously sample real SoC/Battery temperature & memory every 2 seconds even before server start
+                LaunchedEffect(Unit) {
+                    while (isActive) {
+                        GgufServerService.sampleDeviceHardwareSensors(context)
+                        delay(2000L)
+                    }
+                }
 
                 // Single .GGUF File Picker via Android Storage Access Framework
                 val safFilePickerLauncher = rememberLauncherForActivityResult(
@@ -172,23 +187,7 @@ class MainActivity : ComponentActivity() {
                             safFilePickerLauncher.launch(arrayOf("*/*"))
                             return@PocketGgufAppShell
                         }
-
-                        val serviceIntent = Intent(this, GgufServerService::class.java).apply {
-                            action = if (shouldStart) {
-                                GgufServerService.ACTION_START_SERVER
-                            } else {
-                                GgufServerService.ACTION_STOP_SERVER
-                            }
-                        }
-                        if (shouldStart) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                startForegroundService(serviceIntent)
-                            } else {
-                                startService(serviceIntent)
-                            }
-                        } else {
-                            startService(serviceIntent)
-                        }
+                        startOrStopServerService(context, shouldStart)
                     },
                     onPickSafGguf = {
                         safFilePickerLauncher.launch(arrayOf("*/*"))
@@ -198,8 +197,11 @@ class MainActivity : ComponentActivity() {
                     },
                     onMountAndCopyModelId = { model ->
                         EngineStateRepository.update { it.copy(activeModel = model) }
+                        EngineStateRepository.logDiagnostic("MODEL", "Mounted active model '${model.id}' (${model.sizeMb} MB, GGUF v${model.ggufVersion})")
                         saveSelectedModelUris(context)
                         copyClientModelIdToClipboard(context, model.id)
+                        // Ensure local server is running or reloaded with the newly mounted model
+                        startOrStopServerService(context, true)
                     },
                     onRemoveModel = { model ->
                         EngineStateRepository.update { current ->
@@ -235,10 +237,16 @@ class MainActivity : ComponentActivity() {
                 availableModels = deduplicated
             )
         }
+        EngineStateRepository.logDiagnostic(
+            "SAF",
+            "Mounted .gguf model '${model.id}' (${model.sizeMb} MB, headerVerified=${model.headerVerified}, uri=${model.uriString})"
+        )
         saveSelectedModelUris(context)
         if (showToast) {
             copyClientModelIdToClipboard(context, model.id)
         }
+        // Automatically start/reload GgufServerService so the mounted model is ready for Chat immediately
+        startOrStopServerService(context, true)
     }
 
     /**
@@ -265,6 +273,16 @@ class MainActivity : ComponentActivity() {
                     }
                     if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
                         sizeBytes = cursor.getLong(sizeIdx)
+                    }
+                }
+            }
+        }
+
+        if (sizeBytes <= 0L) {
+            runCatching {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                    if (pfd.statSize > 0L) {
+                        sizeBytes = pfd.statSize
                     }
                 }
             }
@@ -297,9 +315,12 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }.onFailure { err ->
+            EngineStateRepository.logDiagnostic("SAF_ERR", "Header read failed for $uri: ${err.message}")
         }
 
         if (!headerValid && !resolvedFilename.endsWith(".gguf", ignoreCase = true)) {
+            EngineStateRepository.logDiagnostic("SAF_REJECT", "Rejected non-GGUF file: $resolvedFilename")
             Toast.makeText(
                 context,
                 "Selected file ($resolvedFilename) does not appear to be a .gguf model.",
@@ -357,6 +378,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }.onFailure { err ->
+            EngineStateRepository.logDiagnostic("SAF_SCAN", "Folder scan error: ${err.message}")
         }
         return results
     }
@@ -414,6 +437,14 @@ class MainActivity : ComponentActivity() {
                     activeModel = discovered.first()
                 )
             }
+            EngineStateRepository.logDiagnostic(
+                "RESTORE",
+                "Restored ${discovered.size} local .gguf model(s); active='${discovered.first().id}'"
+            )
+            // Automatically start GgufServerService for the restored active model
+            startOrStopServerService(this, true)
+        } else {
+            EngineStateRepository.logDiagnostic("RESTORE", "No pre-saved .gguf URIs yet; waiting for user SAF selection.")
         }
     }
 
@@ -460,6 +491,29 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun startOrStopServerService(context: Context, shouldStart: Boolean) {
+    runCatching {
+        val serviceIntent = Intent(context, GgufServerService::class.java).apply {
+            action = if (shouldStart) {
+                GgufServerService.ACTION_START_SERVER
+            } else {
+                GgufServerService.ACTION_STOP_SERVER
+            }
+        }
+        if (shouldStart) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(serviceIntent)
+            } else {
+                context.startService(serviceIntent)
+            }
+        } else {
+            context.startService(serviceIntent)
+        }
+    }.onFailure { err ->
+        EngineStateRepository.logDiagnostic("SERVICE_ERR", "Failed to start/stop GgufServerService: ${err.javaClass.simpleName}: ${err.message}")
+    }
+}
+
 enum class AppTab(val title: String) {
     TELEMETRY("Telemetry"),
     MODELS("Models"),
@@ -487,6 +541,7 @@ fun PocketGgufAppShell(
     onMountAndCopyModelId: (GgufModelInfo) -> Unit,
     onRemoveModel: (GgufModelInfo) -> Unit
 ) {
+    val context = LocalContext.current
     var activeTab by remember { mutableStateOf(AppTab.TELEMETRY) }
     var selfTestLoading by remember { mutableStateOf(false) }
     var selfTestResult by remember { mutableStateOf<String?>(null) }
@@ -500,7 +555,7 @@ fun PocketGgufAppShell(
         selfTestLoading = true
         selfTestResult = "Sending POST http://127.0.0.1:${state.port}/v1/chat/completions (model=\"${state.activeModel.id}\")..."
         coroutineScope.launch {
-            val responseText = executeLocalSelfApiTest(state)
+            val responseText = executeLocalSelfApiTest(context, state)
             selfTestResult = responseText
             selfTestLoading = false
         }
@@ -521,7 +576,7 @@ fun PocketGgufAppShell(
             chatSending = true
 
             coroutineScope.launch {
-                val reply = executeLocalChatTurn(state, updatedHistory)
+                val reply = executeLocalChatTurn(context, state, updatedHistory)
                 chatMessages = chatMessages + reply
                 chatSending = false
             }
@@ -682,51 +737,129 @@ fun PocketGgufAppShell(
 }
 
 /**
- * Executes a real local HTTP POST to http://127.0.0.1:<port>/v1/chat/completions
- * to verify end-to-end model answering.
+ * Ensures the native JNI model is loaded in-process if fallback inference is needed.
  */
-private suspend fun executeLocalSelfApiTest(state: EngineTelemetryState): String =
-    withContext(Dispatchers.IO) {
-        if (!state.hasValidModelMounted) {
-            return@withContext "NO MODEL MOUNTED: Tap 'Select .GGUF File from Phone' to pick a .gguf model from your storage first."
+private fun ensureInProcessJniModelLoaded(context: Context, state: EngineTelemetryState) {
+    val active = state.activeModel
+    var safPfd: ParcelFileDescriptor? = null
+    try {
+        val loadPath = if (active.uriString.startsWith("content://")) {
+            val uri = Uri.parse(active.uriString)
+            safPfd = context.contentResolver.openFileDescriptor(uri, "r")
+            if (safPfd != null) {
+                "/proc/self/fd/${safPfd.fd}"
+            } else {
+                active.filename
+            }
+        } else {
+            active.uriString.ifBlank { active.filename }
         }
-        if (!state.serverRunning) {
-            return@withContext "SERVER STOPPED: Tap 'Start Server' first so /v1/chat/completions is actively serving '${state.activeModel.id}'."
+        val kvCode = when (state.kvCacheQuant) {
+            "Q4_0" -> 2
+            "Q8_0" -> 1
+            else -> 0
         }
+        LlamaBridge.nativeLoadModel(
+            modelPath = loadPath,
+            nCtx = state.contextLength,
+            nThreads = state.effectiveActiveThreads,
+            kvQuantType = kvCode,
+            prefixKeepTokens = if (state.prefixCachePinningEnabled) state.pinnedSystemTokens else 0,
+            coreAffinityMask = if (state.bigLittleCorePinning) 0xFC else 0xFF
+        )
+    } catch (e: Exception) {
+        EngineStateRepository.logDiagnostic("JNI_LOAD_ERR", "In-process JNI model load warning: ${e.message}")
+    } finally {
+        runCatching { safPfd?.close() }
+    }
+}
 
-        val payload = """
-            {
-              "model": "${state.activeModel.id}",
-              "messages": [
-                {"role": "user", "content": "Self-test diagnostic: confirm GGUF model ID and single-slot readiness."}
-              ],
-              "temperature": 0.1
-            }
-        """.trimIndent()
+/**
+ * Executes a real local HTTP POST to http://127.0.0.1:<port>/v1/chat/completions
+ * to verify end-to-end model answering (with auto-start and detailed diagnostic logging).
+ */
+private suspend fun executeLocalSelfApiTest(
+    context: Context,
+    state: EngineTelemetryState
+): String = withContext(Dispatchers.IO) {
+    if (!state.hasValidModelMounted) {
+        EngineStateRepository.logDiagnostic("SELF_TEST", "Aborted: No .gguf model mounted yet.")
+        return@withContext "NO MODEL MOUNTED: Tap 'Select .GGUF File from Phone' to pick a .gguf model from your storage first."
+    }
 
-        try {
-            val url = URL("http://127.0.0.1:${state.port}/v1/chat/completions")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 5000
-                readTimeout = 15000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Authorization", "Bearer ${state.bearerToken}")
-            }
-            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
-                writer.write(payload)
-                writer.flush()
-            }
-
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val body = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
-            "HTTP $code (Model: ${state.activeModel.id})\n$body"
-        } catch (e: Exception) {
-            "Local Socket Test Error: ${e.message}"
+    if (!EngineStateRepository.state.value.serverRunning) {
+        EngineStateRepository.logDiagnostic("SELF_TEST", "Server was stopped; auto-starting GgufServerService on :${state.port}...")
+        startOrStopServerService(context, true)
+        repeat(8) {
+            delay(200L)
+            if (EngineStateRepository.state.value.serverRunning) return@repeat
         }
     }
+
+    val currentState = EngineStateRepository.state.value
+    val payload = JSONObject().apply {
+        put("model", currentState.activeModel.id)
+        put(
+            "messages",
+            JSONArray().put(
+                JSONObject().apply {
+                    put("role", "user")
+                    put("content", "Self-test diagnostic: confirm GGUF model ID and single-slot readiness.")
+                }
+            )
+        )
+        put("temperature", 0.1)
+    }.toString()
+
+    EngineStateRepository.logDiagnostic(
+        "SELF_TEST",
+        "POST http://127.0.0.1:${currentState.port}/v1/chat/completions (${payload.toByteArray().size} bytes)"
+    )
+
+    try {
+        val url = URL("http://127.0.0.1:${currentState.port}/v1/chat/completions")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 5000
+            readTimeout = 15000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", "Bearer ${currentState.bearerToken}")
+        }
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+            writer.write(payload)
+            writer.flush()
+        }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = if (stream != null) {
+            BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+        } else {
+            ""
+        }
+        EngineStateRepository.logDiagnostic("SELF_TEST", "HTTP $code received (${body.length} chars)")
+        "HTTP $code (Model: ${currentState.activeModel.id})\n$body"
+    } catch (e: Exception) {
+        EngineStateRepository.logDiagnostic(
+            "SELF_TEST_ERR",
+            "HTTP loopback error (${e.javaClass.simpleName}: ${e.message}); testing direct JNI fallback..."
+        )
+        runCatching {
+            ensureInProcessJniModelLoaded(context, currentState)
+            val jniBody = LlamaBridge.nativeCompleteChat(
+                promptJson = payload,
+                enforceJsonGrammar = currentState.gbnfJsonGrammarEnabled,
+                reusePinnedPrefix = currentState.prefixCachePinningEnabled
+            )
+            EngineStateRepository.logDiagnostic("SELF_TEST_JNI", "Direct JNI fallback succeeded (${jniBody.length} chars)")
+            "DIRECT JNI FALLBACK (Socket note: ${e.message})\n$jniBody"
+        }.getOrElse { jniErr ->
+            EngineStateRepository.logDiagnostic("SELF_TEST_FATAL", "JNI fallback also failed: ${jniErr.message}")
+            "Local Socket & JNI Error: ${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+}
 
 @Composable
 fun TelemetryScreen(
@@ -983,9 +1116,9 @@ fun TelemetryScreen(
                     modifier = Modifier.weight(1f)
                 )
                 TelemetryCard(
-                    label = "SoC Thermal Gov",
-                    value = "${state.socTempC}°C",
-                    subtext = "${state.effectiveActiveThreads}/${state.cpuThreads}T · ${state.coreAffinityMaskHex.take(4)}",
+                    label = "Device Thermal Sensor",
+                    value = if (state.socTempC > 0.0) "${state.socTempC}°C" else "--°C",
+                    subtext = "${state.tempSensorSource} · ${state.effectiveActiveThreads}/${state.cpuThreads}T",
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -1011,7 +1144,7 @@ fun TelemetryScreen(
                             fontSize = 14.sp
                         )
                         Text(
-                            text = "${state.totalAllocatedMb} / 8448 MB",
+                            text = "${state.totalAllocatedMb} / ${state.deviceTotalRamMb} MB",
                             fontSize = 12.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.SemiBold
@@ -1050,9 +1183,9 @@ fun TelemetryScreen(
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         text = if (state.hasValidModelMounted) {
-                            "Weights (${state.activeModel.sizeMb} MB mmap) · KV Cache (${state.kvCacheQuant}: ${state.kvCacheMb} MB)"
+                            "Weights (${state.activeModel.sizeMb} MB mmap) · KV (${state.kvCacheQuant}: ${state.kvCacheMb} MB) · Phone Free RAM: ${state.deviceAvailRamMb} MB"
                         } else {
-                            "Select a .GGUF file from phone storage to inspect memory footprint"
+                            "Phone Total RAM: ${state.deviceTotalRamMb} MB (Free: ${state.deviceAvailRamMb} MB) · Select a .GGUF file to inspect footprint"
                         },
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
@@ -1441,6 +1574,8 @@ fun ApiBridgeScreen(
     selfTestResult: String?,
     onRunSelfApiTest: () -> Unit
 ) {
+    val context = LocalContext.current
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -1504,6 +1639,11 @@ fun ApiBridgeScreen(
             }
         }
 
+        // Expandable / Copyable Diagnostic Log Viewer inside API Bridge
+        item {
+            DiagnosticLogConsoleCard(state = state, context = context)
+        }
+
         item {
             Text(
                 text = "Ingress OpenAI Request & Mutex Audit Log (${state.auditLogs.size})",
@@ -1551,73 +1691,188 @@ fun ApiBridgeScreen(
 }
 
 /**
+ * Reusable In-App Diagnostic Log Viewer with 1-Tap "Copy All Logs" button.
+ */
+@Composable
+fun DiagnosticLogConsoleCard(
+    state: EngineTelemetryState,
+    context: Context
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFF0F172A),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, Color(0xFF334155), RoundedCornerShape(12.dp))
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "ENGINE & CHAT DIAGNOSTIC LOGS (${state.diagnosticLogs.size})",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF34D399)
+                    )
+                    Text(
+                        text = "ADB command: adb logcat -s PocketGGUF PocketGGUF_JNI",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF94A3B8)
+                    )
+                }
+
+                Button(
+                    onClick = {
+                        val report = buildString {
+                            appendLine("=== PocketGGUF Diagnostic Report ===")
+                            appendLine("Server Running: ${state.serverRunning} (127.0.0.1:${state.port})")
+                            appendLine("Active Model ID: ${state.activeModel.id} (${state.activeModel.sizeMb} MB, GGUF v${state.activeModel.ggufVersion})")
+                            appendLine("Model URI: ${state.activeModel.uriString}")
+                            appendLine("Thermal Sensor: ${state.socTempC}°C (${state.tempSensorSource})")
+                            appendLine("Phone RAM: ${state.deviceAvailRamMb} MB free / ${state.deviceTotalRamMb} MB total")
+                            appendLine("KV Cache: ${state.kvCacheQuant} (${state.kvCacheMb} MB), n_ctx=${state.contextLength}")
+                            appendLine("--- Recent Events ---")
+                            state.diagnosticLogs.forEach { appendLine(it) }
+                        }
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("PocketGGUF Logs", report))
+                        Toast.makeText(context, "Copied all diagnostic logs to clipboard!", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = "Copy Logs",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF0F172A)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            val linesToShow = state.diagnosticLogs.take(18)
+            if (linesToShow.isEmpty()) {
+                Text(
+                    text = "No log events recorded yet.",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(0xFF94A3B8)
+                )
+            } else {
+                linesToShow.forEach { line ->
+                    Text(
+                        text = line,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (line.contains("ERR") || line.contains("FATAL")) {
+                            Color(0xFFFCA5A5)
+                        } else {
+                            Color(0xFFE2E8F0)
+                        },
+                        modifier = Modifier.padding(vertical = 1.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
  * Sends a multi-turn OpenAI /v1/chat/completions request directly to the local server
- * hosted by GgufServerService on http://127.0.0.1:<port>/v1/chat/completions
+ * hosted by GgufServerService on http://127.0.0.1:<port>/v1/chat/completions.
+ *
+ * Also auto-starts GgufServerService if the model was mounted in standby, and falls back
+ * to direct in-process JNI inference if the local HTTP socket fails.
  */
 private suspend fun executeLocalChatTurn(
+    context: Context,
     state: EngineTelemetryState,
     history: List<LocalChatMessage>
 ): LocalChatMessage = withContext(Dispatchers.IO) {
     val t0 = System.currentTimeMillis()
 
     if (!state.hasValidModelMounted) {
+        EngineStateRepository.logDiagnostic("CHAT_ERR", "Send aborted: No .GGUF model mounted.")
         return@withContext LocalChatMessage(
             id = "err-${System.currentTimeMillis()}",
             role = "assistant",
-            content = "No .GGUF file is mounted yet. Tap 'Select .GGUF File' above to pick a model from your phone storage.",
+            content = "No .GGUF file is mounted yet. Tap 'Select .GGUF' above to pick a model from your phone storage.",
             modelId = "unmounted",
             latencyMs = 1L,
             isError = true
         )
     }
 
-    if (!state.serverRunning) {
-        return@withContext LocalChatMessage(
-            id = "err-${System.currentTimeMillis()}",
-            role = "assistant",
-            content = "Local OpenAI server is currently stopped. Tap 'Start Server' above to start serving ${state.activeModel.id} on http://127.0.0.1:${state.port}/v1.",
-            modelId = state.activeModel.id,
-            latencyMs = 1L,
-            isError = true
+    // If the user mounted a model but hasn't tapped 'Start Server' yet, auto-start it now
+    if (!EngineStateRepository.state.value.serverRunning) {
+        EngineStateRepository.logDiagnostic(
+            "CHAT",
+            "Server was in standby; auto-starting GgufServerService for '${state.activeModel.id}'..."
         )
+        startOrStopServerService(context, true)
+        repeat(8) {
+            delay(200L)
+            if (EngineStateRepository.state.value.serverRunning) return@repeat
+        }
     }
 
+    val liveState = EngineStateRepository.state.value
+    val messagesArray = JSONArray()
+    for (msg in history.takeLast(12)) {
+        if (!msg.isError) {
+            val obj = JSONObject()
+            obj.put("role", msg.role)
+            obj.put("content", msg.content)
+            messagesArray.put(obj)
+        }
+    }
+
+    val rootPayload = JSONObject().apply {
+        put("model", liveState.activeModel.id)
+        put("messages", messagesArray)
+        put("temperature", 0.2)
+    }
+    val payloadStr = rootPayload.toString()
+
+    EngineStateRepository.logDiagnostic(
+        "CHAT_REQ",
+        "POST http://127.0.0.1:${liveState.port}/v1/chat/completions (model='${liveState.activeModel.id}', ${payloadStr.toByteArray().size} bytes)"
+    )
+
     try {
-        val messagesArray = JSONArray()
-        for (msg in history.takeLast(12)) {
-            if (!msg.isError) {
-                val obj = JSONObject()
-                obj.put("role", msg.role)
-                obj.put("content", msg.content)
-                messagesArray.put(obj)
-            }
-        }
-
-        val rootPayload = JSONObject().apply {
-            put("model", state.activeModel.id)
-            put("messages", messagesArray)
-            put("temperature", 0.2)
-        }
-
-        val url = URL("http://127.0.0.1:${state.port}/v1/chat/completions")
+        val url = URL("http://127.0.0.1:${liveState.port}/v1/chat/completions")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 5000
             readTimeout = 30000
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
-            setRequestProperty("Authorization", "Bearer ${state.bearerToken}")
+            setRequestProperty("Authorization", "Bearer ${liveState.bearerToken}")
         }
 
         OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
-            writer.write(rootPayload.toString())
+            writer.write(payloadStr)
             writer.flush()
         }
 
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val body = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+        val body = if (stream != null) {
+            BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+        } else {
+            ""
+        }
         val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+
+        EngineStateRepository.logDiagnostic("CHAT_RES", "HTTP $code in ${elapsed}ms (${body.length} chars)")
 
         val parsed = runCatching { JSONObject(body) }.getOrNull()
         if (code in 200..299 && parsed != null) {
@@ -1633,31 +1888,71 @@ private suspend fun executeLocalChatTurn(
                 id = "ast-${System.currentTimeMillis()}",
                 role = "assistant",
                 content = content,
-                modelId = state.activeModel.id,
+                modelId = liveState.activeModel.id,
                 latencyMs = elapsed,
                 reusedPrefixTokens = reused,
                 isError = false
             )
         } else {
             val errMsg = parsed?.optJSONObject("error")?.optString("message") ?: "HTTP $code: $body"
+            EngineStateRepository.logDiagnostic("CHAT_HTTP_ERR", errMsg)
             LocalChatMessage(
                 id = "err-${System.currentTimeMillis()}",
                 role = "assistant",
                 content = errMsg,
-                modelId = state.activeModel.id,
+                modelId = liveState.activeModel.id,
                 latencyMs = elapsed,
                 isError = true
             )
         }
     } catch (e: Exception) {
-        LocalChatMessage(
-            id = "err-${System.currentTimeMillis()}",
-            role = "assistant",
-            content = "Local Server Connection Error: ${e.message ?: "Failed to connect to 127.0.0.1:${state.port}"}",
-            modelId = state.activeModel.id,
-            latencyMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L),
-            isError = true
+        EngineStateRepository.logDiagnostic(
+            "CHAT_SOCK_ERR",
+            "HTTP loopback failed (${e.javaClass.simpleName}: ${e.message}); running direct in-process JNI fallback..."
         )
+        // Direct in-process JNI fallback so the user always gets a reply even if port 8080 is blocked
+        runCatching {
+            ensureInProcessJniModelLoaded(context, liveState)
+            val jniBody = LlamaBridge.nativeCompleteChat(
+                promptJson = payloadStr,
+                enforceJsonGrammar = liveState.gbnfJsonGrammarEnabled,
+                reusePinnedPrefix = liveState.prefixCachePinningEnabled
+            )
+            val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+            val parsed = JSONObject(jniBody)
+            val content = parsed
+                .optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content")
+                ?.ifBlank { jniBody }
+                ?: jniBody
+            val reused = parsed.optJSONObject("usage")?.optInt("prefix_cache_reused_tokens", 0) ?: 0
+            EngineStateRepository.logDiagnostic("CHAT_JNI_OK", "Direct JNI reply generated in ${elapsed}ms")
+            LocalChatMessage(
+                id = "ast-${System.currentTimeMillis()}",
+                role = "assistant",
+                content = content,
+                modelId = liveState.activeModel.id,
+                latencyMs = elapsed,
+                reusedPrefixTokens = reused,
+                isError = false
+            )
+        }.getOrElse { jniErr ->
+            val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+            EngineStateRepository.logDiagnostic(
+                "CHAT_FATAL",
+                "Both HTTP socket (${e.message}) and JNI fallback (${jniErr.message}) failed."
+            )
+            LocalChatMessage(
+                id = "err-${System.currentTimeMillis()}",
+                role = "assistant",
+                content = "Chat Error (${e.javaClass.simpleName}): ${e.message ?: "Failed to connect to 127.0.0.1:${liveState.port}"}. Tap 'Logs (${liveState.diagnosticLogs.size})' above to copy full diagnostics.",
+                modelId = liveState.activeModel.id,
+                latencyMs = elapsed,
+                isError = true
+            )
+        }
     }
 }
 
@@ -1675,6 +1970,7 @@ fun LocalModelChatScreen(
     onPickSafGguf: () -> Unit
 ) {
     val context = LocalContext.current
+    var showDiagnostics by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -1702,7 +1998,7 @@ fun LocalModelChatScreen(
                             } else if (!state.hasValidModelMounted) {
                                 "○ NO .GGUF MODEL SELECTED"
                             } else {
-                                "◐ LOCAL SERVER STOPPED (STANDBY)"
+                                "◐ LOCAL SERVER IN STANDBY (AUTO-STARTS ON SEND)"
                             },
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
@@ -1741,6 +2037,16 @@ fun LocalModelChatScreen(
                                 Text("Start Server", fontSize = 11.sp, maxLines = 1)
                             }
                         }
+                        OutlinedButton(
+                            onClick = { showDiagnostics = !showDiagnostics },
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (showDiagnostics) "Hide Logs" else "Logs (${state.diagnosticLogs.size})",
+                                fontSize = 11.sp,
+                                maxLines = 1
+                            )
+                        }
                         if (messages.isNotEmpty()) {
                             OutlinedButton(
                                 onClick = onClearChat,
@@ -1752,6 +2058,11 @@ fun LocalModelChatScreen(
                     }
                 }
             }
+        }
+
+        if (showDiagnostics) {
+            Spacer(modifier = Modifier.height(8.dp))
+            DiagnosticLogConsoleCard(state = state, context = context)
         }
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -1781,7 +2092,7 @@ fun LocalModelChatScreen(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "Messages sent here travel directly through your phone's local OpenAI HTTP server (http://127.0.0.1:${state.port}/v1/chat/completions) to the active GGUF model (${state.activeModel.id}).",
+                                text = "Messages sent here travel directly through your phone's local OpenAI HTTP server (http://127.0.0.1:${state.port}/v1/chat/completions) to the active GGUF model (${state.activeModel.id}). Tap 'Logs (${state.diagnosticLogs.size})' above at any time to view or copy engine logs.",
                                 fontSize = 12.sp,
                                 color = Color(0xFF475569)
                             )

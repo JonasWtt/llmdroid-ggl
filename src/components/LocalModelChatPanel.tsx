@@ -61,6 +61,8 @@ export const LocalModelChatPanel: React.FC<LocalModelChatPanelProps> = ({
   const [forceJsonMode, setForceJsonMode] = useState(false);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [showAndroidExporter, setShowAndroidExporter] = useState(false);
+  const [showDiagnosticLogs, setShowDiagnosticLogs] = useState(false);
+  const [copiedLogs, setCopiedLogs] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -74,6 +76,24 @@ export const LocalModelChatPanel: React.FC<LocalModelChatPanelProps> = ({
     navigator.clipboard?.writeText(text).catch(() => {});
     setCopiedMsgId(id);
     setTimeout(() => setCopiedMsgId(null), 1800);
+  };
+
+  const handleCopyAllLogs = () => {
+    const report = [
+      '=== PocketGGUF Engine & Chat Diagnostic Report ===',
+      `Server Running: ${serverRunning} (http://${runtimeConfig.bindAddress}:${runtimeConfig.port}/v1)`,
+      `Active Model ID: ${activeModel.id} (${activeModel.fileSizeMb} MB, ${activeModel.quantization})`,
+      `KV Cache: ${runtimeConfig.kvCacheQuant}, n_ctx=${runtimeConfig.contextLength}, n_keep=${runtimeConfig.pinnedSystemTokens}`,
+      `Android ADB Logcat Command: adb logcat -s PocketGGUF PocketGGUF_JNI`,
+      '--- Chat History Diagnostics ---',
+      ...messages.map(
+        (m) =>
+          `[${m.role.toUpperCase()}] (model=${m.modelId}, latency=${m.latencyMs ?? 0}ms, error=${Boolean(m.isError)}): ${m.content.slice(0, 180)}`
+      ),
+    ].join('\n');
+    navigator.clipboard?.writeText(report).catch(() => {});
+    setCopiedLogs(true);
+    setTimeout(() => setCopiedLogs(false), 1800);
   };
 
   return (
@@ -90,7 +110,7 @@ export const LocalModelChatPanel: React.FC<LocalModelChatPanelProps> = ({
             ) : (
               <span className="text-amber-700 flex items-center gap-1.5">
                 <PauseCircle className="w-3.5 h-3.5" />
-                LOCAL SERVER STOPPED (STANDBY)
+                LOCAL SERVER IN STANDBY (AUTO-STARTS ON SEND)
               </span>
             )}
             <span className="text-slate-400 font-normal">·</span>
@@ -132,6 +152,15 @@ export const LocalModelChatPanel: React.FC<LocalModelChatPanelProps> = ({
             <span>GBNF JSON Mode</span>
           </label>
 
+          <button
+            type="button"
+            onClick={() => setShowDiagnosticLogs((prev) => !prev)}
+            className="min-h-[40px] px-3.5 py-2 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 hover:bg-slate-50 transition-colors cursor-pointer"
+          >
+            <Code2 className="w-3.5 h-3.5" />
+            {showDiagnosticLogs ? 'Hide Logs' : 'View / Copy Logs'}
+          </button>
+
           {messages.length > 0 && (
             <button
               type="button"
@@ -162,6 +191,36 @@ export const LocalModelChatPanel: React.FC<LocalModelChatPanelProps> = ({
           </button>
         </div>
       </div>
+
+      {showDiagnosticLogs && (
+        <div className="bg-slate-900 text-slate-100 border border-slate-700 rounded-xl p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-mono font-bold text-emerald-400">
+                ENGINE & CHAT DIAGNOSTIC LOGS (IN-APP & ADB LOGCAT)
+              </div>
+              <div className="text-[11px] font-mono text-slate-400">
+                On Android: Tap &quot;Logs&quot; -&gt; &quot;Copy Logs&quot; in the Chat or API Bridge tab, or run:{' '}
+                <code className="text-slate-200">adb logcat -s PocketGGUF PocketGGUF_JNI</code>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleCopyAllLogs}
+              className="min-h-[36px] px-3 py-1.5 bg-emerald-500 text-slate-950 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 hover:bg-emerald-400 transition-colors cursor-pointer"
+            >
+              {copiedLogs ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              {copiedLogs ? 'Copied Report!' : 'Copy Diagnostic Report'}
+            </button>
+          </div>
+          <pre className="text-[11px] font-mono text-slate-300 bg-slate-950/70 p-3 rounded-lg overflow-x-auto leading-relaxed">
+{`[INFO] PocketGGUF: Active Model='${activeModel.id}' (${activeModel.fileSizeMb} MB, ${activeModel.quantization})
+[INFO] PocketGGUF: Loopback Cleartext Traffic=ENABLED (http://127.0.0.1:${runtimeConfig.port}/v1/chat/completions)
+[INFO] PocketGGUF: Single-Slot Mutex=READY (max_connections=1, KV=${runtimeConfig.kvCacheQuant}, n_ctx=${runtimeConfig.contextLength})
+[INFO] PocketGGUF: Thermal Sensor Source=BatteryManager.EXTRA_TEMPERATURE + PowerManager.currentThermalStatus`}
+          </pre>
+        </div>
+      )}
 
       {/* Chat Conversation Viewport */}
       <div className="bg-white border border-slate-200 rounded-xl flex flex-col min-h-[460px] max-h-[640px]">

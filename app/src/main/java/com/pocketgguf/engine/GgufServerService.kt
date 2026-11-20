@@ -1,13 +1,19 @@
 package com.pocketgguf.engine
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ServiceInfo
+import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -17,51 +23,66 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.OutputStreamWriter
 import java.io.PrintWriter
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
+import kotlin.math.roundToInt
 
 /**
  * Headless Android Foreground Service hosting a dependency-free OpenAI-compatible HTTP server
  * (/v1/models, /v1/chat/completions, /v1/embeddings).
- *
- * Implements Proposals 1-4:
- *  1. KV Q4_0 Quantization Cache (GGML_TYPE_Q4_0)
- *  2. Single-Slot KV Prefix Cache Pinning (n_keep)
- *  3. GBNF Grammar & JSON Schema Enforcement
- *  4. Adaptive Thermal Governor & Big.LITTLE Core Pinning
  */
 class GgufServerService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
     private var acceptJob: Job? = null
+    private var telemetryJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var activeModelPfd: ParcelFileDescriptor? = null
+    private var lastLoadedUriString: String = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        EngineStateRepository.logDiagnostic("SERVICE", "GgufServerService created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START_SERVER
+        EngineStateRepository.logDiagnostic("SERVICE", "onStartCommand action=$action")
         if (action == ACTION_STOP_SERVER) {
             stopServerAndService()
             return START_NOT_STICKY
         }
 
         val currentState = EngineStateRepository.state.value
-        startForeground(
-            NOTIFICATION_ID,
-            buildNotification("Listening on ${currentState.bindAddress}:${currentState.port}/v1 (KV=${currentState.kvCacheQuant}, n_keep=${currentState.pinnedSystemTokens})")
+        val notification = buildNotification(
+            "Listening on ${currentState.bindAddress}:${currentState.port}/v1 (KV=${currentState.kvCacheQuant}, n_keep=${currentState.pinnedSystemTokens})"
         )
+
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        }.onFailure { err ->
+            EngineStateRepository.logDiagnostic("ERROR", "startForeground failed: ${err.javaClass.simpleName}: ${err.message}")
+        }
 
         acquireWakeLockIfEnabled(currentState.wakeLockEnabled)
         startHttpServerLoop(currentState.bindAddress, currentState.port)
@@ -70,29 +91,39 @@ class GgufServerService : Service() {
         return START_STICKY
     }
 
-    private var activeModelPfd: android.os.ParcelFileDescriptor? = null
-    private var lastLoadedUriString: String = ""
-
     private fun resolveNativePathOrFd(uriString: String): String {
         if (uriString.startsWith("content://")) {
-            runCatching {
+            try {
                 activeModelPfd?.close()
-                val uri = android.net.Uri.parse(uriString)
+                val uri = Uri.parse(uriString)
                 val pfd = contentResolver.openFileDescriptor(uri, "r")
                 if (pfd != null) {
                     activeModelPfd = pfd
-                    return "/proc/self/fd/${pfd.fd}"
+                    val fdPath = "/proc/self/fd/${pfd.fd}"
+                    EngineStateRepository.logDiagnostic("SAF_FD", "Opened ParcelFileDescriptor -> $fdPath (size=${pfd.statSize / (1024 * 1024)} MB)")
+                    return fdPath
+                } else {
+                    EngineStateRepository.logDiagnostic("ERROR", "openFileDescriptor returned null for $uriString")
                 }
+            } catch (e: Exception) {
+                EngineStateRepository.logDiagnostic("ERROR", "openFileDescriptor failed: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
         return uriString
     }
 
     private fun ensureActiveModelLoadedInJni(state: EngineTelemetryState) {
-        if (!state.hasValidModelMounted) return
+        if (!state.hasValidModelMounted) {
+            EngineStateRepository.logDiagnostic("WARN", "ensureActiveModelLoadedInJni skipped: no valid model mounted")
+            return
+        }
         if (lastLoadedUriString != state.activeModel.uriString) {
             val nativePath = resolveNativePathOrFd(state.activeModel.uriString)
-            LlamaBridge.nativeLoadModel(
+            EngineStateRepository.logDiagnostic(
+                "JNI_LOAD",
+                "Loading model '${state.activeModel.id}' via path=$nativePath, ctx=${state.contextLength}, kv=${state.kvCacheQuant}"
+            )
+            val rc = LlamaBridge.nativeLoadModel(
                 modelPathOrFd = nativePath,
                 contextLength = state.contextLength,
                 batchSize = state.batchSize,
@@ -103,6 +134,7 @@ class GgufServerService : Service() {
                 pinnedPrefixTokens = state.pinnedSystemTokens
             )
             lastLoadedUriString = state.activeModel.uriString
+            EngineStateRepository.logDiagnostic("JNI_LOAD", "nativeLoadModel completed with rc=$rc")
         }
     }
 
@@ -114,6 +146,7 @@ class GgufServerService : Service() {
             try {
                 val state = EngineStateRepository.state.value
                 if (!state.hasValidModelMounted) {
+                    EngineStateRepository.logDiagnostic("ERROR", "Cannot start HTTP server: no .GGUF model mounted")
                     EngineStateRepository.update { it.copy(serverRunning = false) }
                     stopServerAndService()
                     return@launch
@@ -122,52 +155,81 @@ class GgufServerService : Service() {
                 ensureActiveModelLoadedInJni(state)
 
                 val inetAddress = InetAddress.getByName(bindHost)
-                serverSocket = ServerSocket(port, 8, inetAddress)
+                val socket = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(inetAddress, port), 8)
+                }
+                serverSocket = socket
 
                 EngineStateRepository.update { it.copy(serverRunning = true) }
+                EngineStateRepository.logDiagnostic("HTTP_BIND", "ServerSocket listening on http://$bindHost:$port/v1 (model=${state.activeModel.id})")
 
                 while (isActive && serverSocket?.isClosed == false) {
                     val clientSocket = serverSocket?.accept() ?: break
                     launch {
-                        handleClientSocket(clientSocket)
+                        runCatching {
+                            handleClientSocket(clientSocket)
+                        }.onFailure { err ->
+                            EngineStateRepository.logDiagnostic("HTTP_ERR", "handleClientSocket exception: ${err.javaClass.simpleName}: ${err.message}")
+                        }
                     }
                 }
             } catch (e: Exception) {
+                EngineStateRepository.logDiagnostic("HTTP_ERR", "Server loop failed: ${e.javaClass.simpleName}: ${e.message}")
                 EngineStateRepository.update { it.copy(serverRunning = false) }
             }
         }
+    }
+
+    private fun readAsciiHeaderLine(input: InputStream): String? {
+        val bos = ByteArrayOutputStream(128)
+        while (true) {
+            val b = input.read()
+            if (b == -1) {
+                return if (bos.size() == 0) null else bos.toString("UTF-8")
+            }
+            if (b == '\n'.code) {
+                break
+            }
+            if (b != '\r'.code) {
+                bos.write(b)
+            }
+        }
+        return bos.toString("UTF-8")
     }
 
     private fun handleClientSocket(socket: Socket) {
         socket.use { client ->
             client.soTimeout = 30_000
             val clientIp = client.inetAddress?.hostAddress ?: "127.0.0.1"
-            val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.UTF_8))
+            val input = BufferedInputStream(client.getInputStream())
             val writer = PrintWriter(OutputStreamWriter(client.getOutputStream(), Charsets.UTF_8), true)
 
-            val requestLine = reader.readLine() ?: return
+            val requestLine = readAsciiHeaderLine(input) ?: return
             val parts = requestLine.split(" ")
             val method = parts.getOrNull(0) ?: "GET"
             val path = parts.getOrNull(1) ?: "/"
 
             var contentLength = 0
-            var line: String? = reader.readLine()
+            var line: String? = readAsciiHeaderLine(input)
             while (!line.isNullOrEmpty()) {
                 val lower = line.lowercase()
                 if (lower.startsWith("content-length:")) {
                     contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
                 }
-                line = reader.readLine()
+                line = readAsciiHeaderLine(input)
             }
 
-            val bodyChars = CharArray(contentLength.coerceIn(0, 1_048_576))
+            val safeByteLen = contentLength.coerceIn(0, 1_048_576)
+            val bodyBytes = ByteArray(safeByteLen)
             var totalRead = 0
-            while (totalRead < bodyChars.size) {
-                val r = reader.read(bodyChars, totalRead, bodyChars.size - totalRead)
+            while (totalRead < safeByteLen) {
+                val r = input.read(bodyBytes, totalRead, safeByteLen - totalRead)
                 if (r == -1) break
                 totalRead += r
             }
-            val requestBody = String(bodyChars, 0, totalRead)
+            val requestBody = String(bodyBytes, 0, totalRead, Charsets.UTF_8)
+            EngineStateRepository.logDiagnostic("HTTP_REQ", "$method $path from $clientIp (bytes=$totalRead)")
 
             when {
                 method == "GET" && path == "/v1/models" -> {
@@ -210,6 +272,7 @@ class GgufServerService : Service() {
                         EngineStateRepository.update {
                             it.copy(totalMutexRejected = it.totalMutexRejected + 1)
                         }
+                        EngineStateRepository.logDiagnostic("MUTEX_429", "Rejected parallel request while locked by $currentLease")
                         recordAudit(method, path, clientIp, 429, "REJECTED: Single-connection mutex locked", 64, 0, 0.0, 0, false)
                         return
                     }
@@ -233,6 +296,7 @@ class GgufServerService : Service() {
                             )
                         }
 
+                        val t0 = System.currentTimeMillis()
                         val responseJson = LlamaBridge.nativeCompleteChat(
                             promptJson = requestBody,
                             contextLength = snapshot.contextLength,
@@ -242,8 +306,13 @@ class GgufServerService : Service() {
                             enforceGbnfJson = enforceJson,
                             gbnfSchemaName = snapshot.activeGbnfSchemaName
                         )
+                        val jniElapsed = System.currentTimeMillis() - t0
 
                         writeHttpResponse(writer, 200, "OK", responseJson)
+                        EngineStateRepository.logDiagnostic(
+                            "HTTP_200",
+                            "Served $path in ${jniElapsed}ms (model=${snapshot.activeModel.id}, gbnf=$enforceJson)"
+                        )
                         EngineStateRepository.update {
                             it.copy(totalRequestsServed = it.totalRequestsServed + 1)
                         }
@@ -322,10 +391,10 @@ class GgufServerService : Service() {
     }
 
     private fun startTelemetrySamplingLoop() {
-        serviceScope.launch {
+        telemetryJob?.cancel()
+        telemetryJob = serviceScope.launch {
             while (isActive) {
-                val temp = runCatching { LlamaBridge.nativeReadSocTempCelsius() }.getOrDefault(37.2)
-                EngineStateRepository.update { it.copy(socTempC = temp) }
+                sampleDeviceHardwareSensors(this@GgufServerService)
                 delay(2000L)
             }
         }
@@ -346,9 +415,14 @@ class GgufServerService : Service() {
     }
 
     private fun stopServerAndService() {
+        EngineStateRepository.logDiagnostic("SERVICE", "Stopping HTTP Server & Foreground Service")
         acceptJob?.cancel()
+        telemetryJob?.cancel()
         runCatching { serverSocket?.close() }
         runCatching { LlamaBridge.nativeUnloadModel() }
+        runCatching { activeModelPfd?.close() }
+        activeModelPfd = null
+        lastLoadedUriString = ""
         if (wakeLock?.isHeld == true) wakeLock?.release()
         EngineStateRepository.singleConnectionMutex.set(false)
         EngineStateRepository.update {
@@ -396,5 +470,78 @@ class GgufServerService : Service() {
         const val NOTIFICATION_ID = 1001
         const val ACTION_START_SERVER = "com.pocketgguf.engine.START_SERVER"
         const val ACTION_STOP_SERVER = "com.pocketgguf.engine.STOP_SERVER"
+
+        /**
+         * Reads real Android hardware sensors (sysfs thermal zones, BatteryManager thermistor,
+         * PowerManager thermal headroom/status, and ActivityManager RAM).
+         * Never returns a hardcoded 37.2°C fallback.
+         */
+        fun sampleDeviceHardwareSensors(context: Context) {
+            var measuredTempC = -1.0
+            var sensorSource = "Battery Thermistor"
+
+            // 1. Try sysfs thermal zones via JNI if accessible
+            val sysfsTemp = runCatching { LlamaBridge.nativeReadSocTempCelsius() }.getOrDefault(-1.0)
+            if (sysfsTemp in 18.0..105.0) {
+                measuredTempC = (sysfsTemp * 10.0).roundToInt() / 10.0
+                sensorSource = "sysfs thermal_zone"
+            }
+
+            // 2. Read real BatteryManager physical thermistor & battery percentage (works on all Android phones without root)
+            var batteryPct = 100
+            runCatching {
+                val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                if (batteryIntent != null) {
+                    val tempTenths = batteryIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+                    if (tempTenths > 0 && measuredTempC < 0.0) {
+                        measuredTempC = tempTenths / 10.0
+                        sensorSource = "PMIC/Battery Thermistor"
+                    }
+                    val level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                    val scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                    if (level >= 0 && scale > 0) {
+                        batteryPct = ((level * 100f) / scale).roundToInt()
+                    }
+                }
+            }
+
+            // 3. Check Android 10+ PowerManager thermal status
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching {
+                    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                    val statusLabel = when (pm.currentThermalStatus) {
+                        PowerManager.THERMAL_STATUS_NONE -> "Nominal"
+                        PowerManager.THERMAL_STATUS_LIGHT -> "Light"
+                        PowerManager.THERMAL_STATUS_MODERATE -> "Moderate"
+                        PowerManager.THERMAL_STATUS_SEVERE -> "Severe"
+                        else -> "Throttling"
+                    }
+                    sensorSource = "$sensorSource ($statusLabel)"
+                }
+            }
+
+            // 4. Read real phone RAM via ActivityManager.MemoryInfo
+            var totalRamMb = 8192
+            var availRamMb = 4096
+            runCatching {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                val memInfo = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(memInfo)
+                if (memInfo.totalMem > 0) {
+                    totalRamMb = (memInfo.totalMem / (1024L * 1024L)).toInt()
+                    availRamMb = (memInfo.availMem / (1024L * 1024L)).toInt()
+                }
+            }
+
+            EngineStateRepository.update {
+                it.copy(
+                    socTempC = if (measuredTempC > 0.0) measuredTempC else it.socTempC,
+                    tempSensorSource = sensorSource,
+                    batteryPercent = batteryPct,
+                    deviceTotalRamMb = totalRamMb,
+                    deviceAvailRamMb = availRamMb
+                )
+            }
+        }
     }
 }

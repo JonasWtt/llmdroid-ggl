@@ -1,8 +1,12 @@
 package com.pocketgguf.engine
 
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class GgufModelInfo(
@@ -18,6 +22,7 @@ data class GgufModelInfo(
     val maxContext: Int = 32768,
     val ggufVersion: Int = 3,
     val tensorCount: Long = 291L,
+    val kvMetaCount: Long = 24L,
     val headerVerified: Boolean = true
 )
 
@@ -38,7 +43,6 @@ data class ApiAuditRecord(
 
 /**
  * Sentinel placeholder used ONLY when the user has not yet picked a .gguf file from phone storage.
- * No fake model stubs are pre-populated in availableModels.
  */
 val UNMOUNTED_PLACEHOLDER_MODEL = GgufModelInfo(
     id = "no-gguf-selected",
@@ -85,8 +89,13 @@ data class EngineTelemetryState(
     val tokenGenTps: Double = 0.0,
     val totalRequestsServed: Int = 0,
     val totalMutexRejected: Int = 0,
-    val socTempC: Double = 36.8,
-    val auditLogs: List<ApiAuditRecord> = emptyList()
+    val socTempC: Double = 0.0,
+    val tempSensorSource: String = "Reading sensor...",
+    val batteryPercent: Int = 100,
+    val deviceTotalRamMb: Int = 8192,
+    val deviceAvailRamMb: Int = 4096,
+    val auditLogs: List<ApiAuditRecord> = emptyList(),
+    val diagnosticLogs: List<String> = emptyList()
 ) {
     val hasValidModelMounted: Boolean
         get() = activeModel.uriString.isNotBlank() && activeModel.id != UNMOUNTED_PLACEHOLDER_MODEL.id
@@ -115,7 +124,7 @@ data class EngineTelemetryState(
 
     val effectiveActiveThreads: Int
         get() {
-            if (!adaptiveThermalGovernorEnabled) return cpuThreads
+            if (!adaptiveThermalGovernorEnabled || socTempC <= 0.0) return cpuThreads
             val delta = socTempC - thermalThrottleLimitC
             val stepDown = when {
                 delta >= 3.0 -> 3
@@ -152,5 +161,18 @@ object EngineStateRepository {
         _state.value = _state.value.copy(
             auditLogs = (listOf(record) + _state.value.auditLogs).take(30)
         )
+    }
+
+    fun logDiagnostic(tag: String, message: String) {
+        runCatching { Log.i("PocketGGUF", "[$tag] $message") }
+        val timeStr = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
+        val line = "$timeStr [$tag] $message"
+        _state.value = _state.value.copy(
+            diagnosticLogs = (listOf(line) + _state.value.diagnosticLogs).take(120)
+        )
+    }
+
+    fun clearDiagnosticLogs() {
+        _state.value = _state.value.copy(diagnosticLogs = emptyList())
     }
 }
