@@ -1,0 +1,6 @@
+{
+  "name": "PocketGGUF Engine",
+  "description": "Headless local GGUF inference server for Android with single-connection OpenAI API bridge, hardware telemetry, and real-time context & memory profiling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
