@@ -23,7 +23,10 @@ data class GgufModelInfo(
     val ggufVersion: Int = 3,
     val tensorCount: Long = 291L,
     val kvMetaCount: Long = 24L,
-    val headerVerified: Boolean = true
+    val headerVerified: Boolean = true,
+    val magicSignatureHex: String = "0x47475546",
+    val detectedNonGgufFormat: String? = null,
+    val isSplitShard: Boolean = false
 )
 
 data class ApiAuditRecord(
@@ -39,6 +42,23 @@ data class ApiAuditRecord(
     val tokPerSec: Double,
     val reusedPrefixTokens: Int = 0,
     val gbnfApplied: Boolean = false
+)
+
+data class ModelLoadStageStatus(
+    val label: String,
+    val status: String, // "PASS" | "WARN" | "FAIL"
+    val detail: String
+)
+
+data class ModelHealthDiagnosis(
+    val overallStatus: String, // "HEALTHY" | "WARNING" | "ERROR"
+    val errorCode: String,
+    val title: String,
+    val preciseErrorMessage: String,
+    val proposedSolution: String,
+    val autoFixAction: String, // "NONE" | "PICK_GGUF_FILE" | "SCAN_GGUF_FOLDER" | "APPLY_LOW_RAM_SAFE_PROFILE" | "START_LOCAL_SERVER" | "SWITCH_FALLBACK_PORT" | "FORCE_RELEASE_MUTEX"
+    val autoFixButtonLabel: String,
+    val stages: List<ModelLoadStageStatus>
 )
 
 /**
@@ -94,6 +114,10 @@ data class EngineTelemetryState(
     val batteryPercent: Int = 100,
     val deviceTotalRamMb: Int = 8192,
     val deviceAvailRamMb: Int = 4096,
+    val safDescriptorError: String? = null,
+    val jniLoadRc: Int = 0,
+    val jniLoadDiagnosis: String = "Ready",
+    val portBindError: String? = null,
     val auditLogs: List<ApiAuditRecord> = emptyList(),
     val diagnosticLogs: List<String> = emptyList()
 ) {
@@ -138,13 +162,289 @@ data class EngineTelemetryState(
     val coreAffinityMaskHex: String
         get() = if (bigLittleCorePinning) "0xFC (cpu2..cpu7 Prime+Perf)" else "0xFF (All Cores)"
 
+    val weightsMb: Int
+        get() {
+            if (!hasValidModelMounted) return 0
+            return if (mmapEnabled) (activeModel.sizeMb * 0.94).toInt() else activeModel.sizeMb
+        }
+
     val totalAllocatedMb: Int
         get() {
             if (!hasValidModelMounted) return 0
-            val weights = if (mmapEnabled) (activeModel.sizeMb * 0.94).toInt() else activeModel.sizeMb
             val scratch = 96 + (batchSize / 4)
-            return weights + kvCacheMb + scratch
+            return weightsMb + kvCacheMb + scratch
         }
+
+    /**
+     * Evaluates all 5 stages of model loading & runtime execution:
+     *  1. Storage & SAF File Descriptor
+     *  2. Binary GGUF Magic Header & Tensor Directory
+     *  3. Phone Free RAM & KV Cache Memory Budget
+     *  4. Native JNI / GGML Engine Loader
+     *  5. Local OpenAI Loopback HTTP Socket
+     *
+     * Whenever anything goes wrong, returns a clear and precise error message plus a concrete proposed solution.
+     */
+    fun diagnoseModelHealth(): ModelHealthDiagnosis {
+        if (!hasValidModelMounted) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_NO_MODEL_MOUNTED",
+                title = "No .GGUF Model File Mounted",
+                preciseErrorMessage = "No local .gguf model file is currently selected or mounted in the engine.",
+                proposedSolution = "Tap 'Select .GGUF File from Phone Storage' to pick a quantized .gguf model (e.g., Q4_K_M.gguf) from your Downloads or Documents folder.",
+                autoFixAction = "PICK_GGUF_FILE",
+                autoFixButtonLabel = "Select .GGUF File from Phone Storage",
+                stages = listOf(
+                    ModelLoadStageStatus("1. Storage & SAF Descriptor", "FAIL", "No .gguf file URI selected yet"),
+                    ModelLoadStageStatus("2. Binary GGUF Magic Header", "FAIL", "Waiting for file selection"),
+                    ModelLoadStageStatus("3. Phone RAM & KV Budget", "PASS", "$deviceAvailRamMb MB free / $deviceTotalRamMb MB total"),
+                    ModelLoadStageStatus("4. Native JNI Tensor Loader", "FAIL", "Idle (no model mounted)"),
+                    ModelLoadStageStatus("5. Local OpenAI HTTP Socket", "WARN", "Standby (auto-starts on model load)")
+                )
+            )
+        }
+
+        val isOomCritical = totalAllocatedMb > (deviceAvailRamMb * 1.15).toInt() && totalAllocatedMb > (deviceTotalRamMb * 0.72).toInt()
+        val isRamElevated = !isOomCritical && totalAllocatedMb > deviceAvailRamMb
+
+        val stageStorage = if (safDescriptorError != null) {
+            ModelLoadStageStatus("1. Storage & SAF Descriptor", "FAIL", "SAF open failed: $safDescriptorError")
+        } else {
+            ModelLoadStageStatus("1. Storage & SAF Descriptor", "PASS", "Readable (${activeModel.sizeMb} MB · ${activeModel.filename})")
+        }
+
+        val stageHeader = when {
+            !activeModel.headerVerified -> ModelLoadStageStatus(
+                "2. Binary GGUF Magic Header",
+                "FAIL",
+                "Invalid magic ${activeModel.magicSignatureHex} (${activeModel.detectedNonGgufFormat ?: "Not a GGUF file"})"
+            )
+            activeModel.ggufVersion !in 1..3 -> ModelLoadStageStatus(
+                "2. Binary GGUF Magic Header",
+                "FAIL",
+                "Unsupported GGUF format v${activeModel.ggufVersion} (expected v1..v3)"
+            )
+            activeModel.tensorCount <= 0L -> ModelLoadStageStatus(
+                "2. Binary GGUF Magic Header",
+                "FAIL",
+                "Corrupted or truncated header (0 tensors)"
+            )
+            activeModel.isSplitShard -> ModelLoadStageStatus(
+                "2. Binary GGUF Magic Header",
+                "WARN",
+                "Multi-part split shard (${activeModel.filename})"
+            )
+            else -> ModelLoadStageStatus(
+                "2. Binary GGUF Magic Header",
+                "PASS",
+                "Verified GGUF v${activeModel.ggufVersion} (0x47475546 · ${activeModel.tensorCount} tensors)"
+            )
+        }
+
+        val stageRam = when {
+            isOomCritical -> ModelLoadStageStatus(
+                "3. Phone RAM & KV Budget",
+                "FAIL",
+                "Requires $totalAllocatedMb MB (Weights $weightsMb + KV $kvCacheMb MB) vs $deviceAvailRamMb MB free RAM"
+            )
+            isRamElevated -> ModelLoadStageStatus(
+                "3. Phone RAM & KV Budget",
+                "WARN",
+                "High RAM pressure: $totalAllocatedMb MB required vs $deviceAvailRamMb MB free ($deviceTotalRamMb MB total)"
+            )
+            else -> ModelLoadStageStatus(
+                "3. Phone RAM & KV Budget",
+                "PASS",
+                "Fits within RAM: $totalAllocatedMb MB allocated ($deviceAvailRamMb MB free / $deviceTotalRamMb MB total)"
+            )
+        }
+
+        val stageJni = if (jniLoadRc != 0) {
+            ModelLoadStageStatus("4. Native JNI Tensor Loader", "FAIL", jniLoadDiagnosis)
+        } else {
+            ModelLoadStageStatus(
+                "4. Native JNI Tensor Loader",
+                "PASS",
+                "Loaded '${activeModel.id}' (mmap=${if (mmapEnabled) "ON" else "OFF"}, KV=$kvCacheQuant, n_ctx=$contextLength)"
+            )
+        }
+
+        val stageSocket = when {
+            portBindError != null -> ModelLoadStageStatus(
+                "5. Local OpenAI HTTP Socket",
+                "FAIL",
+                "Port :$port bind failed: $portBindError"
+            )
+            !serverRunning -> ModelLoadStageStatus(
+                "5. Local OpenAI HTTP Socket",
+                "WARN",
+                "Standby on $bindAddress:$port (auto-starts on chat send)"
+            )
+            else -> ModelLoadStageStatus(
+                "5. Local OpenAI HTTP Socket",
+                "PASS",
+                "Listening on http://$bindAddress:$port/v1/chat/completions"
+            )
+        }
+
+        val stages = listOf(stageStorage, stageHeader, stageRam, stageJni, stageSocket)
+
+        // 1. SAF File Descriptor Error
+        if (safDescriptorError != null) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_SAF_FILE_DESCRIPTOR_DENIED",
+                title = "Cannot Read .GGUF File from Phone Storage",
+                preciseErrorMessage = "Android Storage Access Framework could not open '${activeModel.filename}' ($safDescriptorError). The file may have been moved, deleted, or its URI permission expired.",
+                proposedSolution = "Tap 'Re-select .GGUF File' below to pick the file again from your phone's Downloads or Documents folder and refresh Android's read permission.",
+                autoFixAction = "PICK_GGUF_FILE",
+                autoFixButtonLabel = "1-Tap Fix: Re-select .GGUF File from Phone",
+                stages = stages
+            )
+        }
+
+        // 2. Invalid GGUF Magic Header
+        if (!activeModel.headerVerified) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_INVALID_GGUF_MAGIC",
+                title = "Invalid File Format: Not a Binary .GGUF Model",
+                preciseErrorMessage = "File '${activeModel.filename}' failed binary GGUF magic header verification. Expected 'GGUF' (0x47475546), but found ${activeModel.magicSignatureHex} (${activeModel.detectedNonGgufFormat ?: "non-GGUF data"}).",
+                proposedSolution = "Ensure you downloaded a direct quantized .gguf weight file (e.g. Q4_K_M.gguf) rather than a PyTorch .bin/.pt archive, Safetensors file, or an HTML login/redirect webpage.",
+                autoFixAction = "PICK_GGUF_FILE",
+                autoFixButtonLabel = "1-Tap Fix: Pick a Valid .GGUF Model File",
+                stages = stages
+            )
+        }
+
+        // 3. Unsupported GGUF Version
+        if (activeModel.ggufVersion !in 1..3) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_UNSUPPORTED_GGUF_VERSION",
+                title = "Unsupported GGUF Format Version (v${activeModel.ggufVersion})",
+                preciseErrorMessage = "Model '${activeModel.filename}' uses GGUF specification version v${activeModel.ggufVersion}. PocketGGUF supports GGUF v1, v2, and v3.",
+                proposedSolution = "Download a standard GGUF v2 or v3 quantization of this model (such as Q4_K_M or IQ4_XS).",
+                autoFixAction = "PICK_GGUF_FILE",
+                autoFixButtonLabel = "Select Another .GGUF Model",
+                stages = stages
+            )
+        }
+
+        // 4. Native JNI Load Error
+        if (jniLoadRc != 0) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_JNI_NATIVE_LOAD_$jniLoadRc",
+                title = "Native JNI Engine Failed to Load Model (Code $jniLoadRc)",
+                preciseErrorMessage = jniLoadDiagnosis,
+                proposedSolution = "Tap 'Re-select .GGUF File' to refresh the Android SAF file descriptor, or tap 'Apply Low-RAM Safe Profile' if the file is too large for current context settings.",
+                autoFixAction = "PICK_GGUF_FILE",
+                autoFixButtonLabel = "1-Tap Fix: Re-select .GGUF File & Reload",
+                stages = stages
+            )
+        }
+
+        // 5. Critical RAM / OOM Risk (e.g. 9B 5832 MB model + large context window)
+        if (isOomCritical) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_OOM_RAM_EXCEEDED",
+                title = "High OOM Risk: Model + Context Exceeds Free Phone RAM",
+                preciseErrorMessage = "Loading '${activeModel.name}' (${activeModel.sizeMb} MB) with n_ctx=$contextLength and KV=$kvCacheQuant requires $totalAllocatedMb MB ($weightsMb MB weights + $kvCacheMb MB KV cache), while your phone currently has $deviceAvailRamMb MB free RAM ($deviceTotalRamMb MB total). Android's Low-Memory Killer (lmkd) may terminate inference.",
+                proposedSolution = "1) Tap 'Apply Low-RAM Safe Profile' below to set KV Cache=Q4_0, Context Length n_ctx=2048, and mmap=ON. 2) Close background apps, or use a smaller 3B–7B Q4_K_M model.",
+                autoFixAction = "APPLY_LOW_RAM_SAFE_PROFILE",
+                autoFixButtonLabel = "1-Tap Fix: Apply Low-RAM Safe Profile (n_ctx=2048, KV=Q4_0, mmap=ON)",
+                stages = stages
+            )
+        }
+
+        // 6. Port Bind Conflict
+        if (portBindError != null) {
+            return ModelHealthDiagnosis(
+                overallStatus = "ERROR",
+                errorCode = "ERR_PORT_BIND_CONFLICT",
+                title = "Local Server Port :$port Is Already in Use",
+                preciseErrorMessage = "Failed to bind local OpenAI server socket on $bindAddress:$port ($portBindError).",
+                proposedSolution = "Tap the button below to switch to port :${port + 1} and restart the local server.",
+                autoFixAction = "SWITCH_FALLBACK_PORT",
+                autoFixButtonLabel = "1-Tap Fix: Switch to Port :${port + 1} & Restart Server",
+                stages = stages
+            )
+        }
+
+        // 7. Split Shard Warning
+        if (activeModel.isSplitShard) {
+            return ModelHealthDiagnosis(
+                overallStatus = "WARNING",
+                errorCode = "WARN_SPLIT_SHARD_GGUF",
+                title = "Multi-Part Split .GGUF Shard Detected",
+                preciseErrorMessage = "'${activeModel.filename}' is a split GGUF shard. Single-file SAF selection only grants access to one shard unless the parent folder is granted.",
+                proposedSolution = "Tap 'Scan GGUF Folder' to grant folder-wide read access to all sibling shards, or merge shards with 'llama-gguf-split --merge'.",
+                autoFixAction = "SCAN_GGUF_FOLDER",
+                autoFixButtonLabel = "1-Tap Fix: Scan GGUF Folder for All Shards",
+                stages = stages
+            )
+        }
+
+        // 8. Server Paused Warning
+        if (!serverRunning) {
+            return ModelHealthDiagnosis(
+                overallStatus = "WARNING",
+                errorCode = "WARN_SERVER_STANDBY",
+                title = "Model Verified & Mounted in Standby (Server Paused)",
+                preciseErrorMessage = "Model '${activeModel.id}' passed all binary GGUF header and RAM checks, but the local HTTP server on :$port is currently stopped.",
+                proposedSolution = "Tap 'Start Local Server' below, or send a message in the Chat tab (which auto-starts the server).",
+                autoFixAction = "START_LOCAL_SERVER",
+                autoFixButtonLabel = "1-Tap Fix: Start Local Server on :$port",
+                stages = stages
+            )
+        }
+
+        // 9. Single-Slot Mutex Busy Warning
+        if (activeLeaseId != null) {
+            return ModelHealthDiagnosis(
+                overallStatus = "WARNING",
+                errorCode = "WARN_MUTEX_LOCKED",
+                title = "Single-Slot Mutex Locked by Active Request ($activeLeaseId)",
+                preciseErrorMessage = "The server is currently generating tokens for '$activeLeaseClient'. Concurrent requests are rejected with HTTP 429.",
+                proposedSolution = "Wait for the current reply to finish, or tap 'Force-Release Mutex Lock' if a client disconnected.",
+                autoFixAction = "FORCE_RELEASE_MUTEX",
+                autoFixButtonLabel = "1-Tap Fix: Force-Release Single-Slot Mutex",
+                stages = stages
+            )
+        }
+
+        // 10. Elevated RAM Pressure Warning (e.g. 9B 5832 MB model on 8-12GB phone)
+        if (isRamElevated) {
+            return ModelHealthDiagnosis(
+                overallStatus = "WARNING",
+                errorCode = "WARN_ELEVATED_RAM",
+                title = "Elevated RAM Usage ($totalAllocatedMb MB vs $deviceAvailRamMb MB Free)",
+                preciseErrorMessage = "'${activeModel.name}' (${activeModel.sizeMb} MB) exceeds current uncached free RAM ($deviceAvailRamMb MB free of $deviceTotalRamMb MB total) and relies on mmap page streaming.",
+                proposedSolution = if (contextLength > 2048 || kvCacheQuant != "Q4_0") {
+                    "For faster and more stable inference on this ${activeModel.sizeMb} MB model, tap below to clamp n_ctx=2048 and KV=Q4_0."
+                } else {
+                    "Close background apps to free up LPDDR5X RAM for faster mmap page-ins."
+                },
+                autoFixAction = if (contextLength > 2048 || kvCacheQuant != "Q4_0") "APPLY_LOW_RAM_SAFE_PROFILE" else "NONE",
+                autoFixButtonLabel = "1-Tap Optimize: Clamp n_ctx=2048 & KV=Q4_0",
+                stages = stages
+            )
+        }
+
+        return ModelHealthDiagnosis(
+            overallStatus = "HEALTHY",
+            errorCode = "OK_READY",
+            title = "Model Loaded & Verified: Serving '${activeModel.id}'",
+            preciseErrorMessage = "All 5 pre-flight checks passed. Binary GGUF v${activeModel.ggufVersion} header verified (${activeModel.tensorCount} tensors), $totalAllocatedMb MB allocated, listening on http://$bindAddress:$port/v1.",
+            proposedSolution = "Everything is healthy. Open the Chat tab or tap Self API Test to chat with ${activeModel.id}.",
+            autoFixAction = "NONE",
+            autoFixButtonLabel = "",
+            stages = stages
+        )
+    }
 }
 
 object EngineStateRepository {

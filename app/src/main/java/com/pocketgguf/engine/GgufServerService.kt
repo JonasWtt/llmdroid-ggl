@@ -47,7 +47,7 @@ class GgufServerService : Service() {
     private var telemetryJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var activeModelPfd: ParcelFileDescriptor? = null
-    private var lastLoadedUriString: String = ""
+    private var lastLoadedSignature: String = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -91,91 +91,173 @@ class GgufServerService : Service() {
         return START_STICKY
     }
 
-    private fun resolveNativePathOrFd(uriString: String): String {
+    private fun resolveNativePathOrFd(uriString: String): String? {
         if (uriString.startsWith("content://")) {
-            try {
+            return try {
                 activeModelPfd?.close()
                 val uri = Uri.parse(uriString)
                 val pfd = contentResolver.openFileDescriptor(uri, "r")
                 if (pfd != null) {
                     activeModelPfd = pfd
                     val fdPath = "/proc/self/fd/${pfd.fd}"
-                    EngineStateRepository.logDiagnostic("SAF_FD", "Opened ParcelFileDescriptor -> $fdPath (size=${pfd.statSize / (1024 * 1024)} MB)")
-                    return fdPath
+                    val statMb = if (pfd.statSize > 0) pfd.statSize / (1024 * 1024) else -1L
+                    EngineStateRepository.update { it.copy(safDescriptorError = null) }
+                    EngineStateRepository.logDiagnostic(
+                        "SAF_FD",
+                        "Opened ParcelFileDescriptor -> $fdPath (statSize=${statMb} MB)"
+                    )
+                    fdPath
                 } else {
-                    EngineStateRepository.logDiagnostic("ERROR", "openFileDescriptor returned null for $uriString")
+                    val msg = "ContentResolver.openFileDescriptor returned null for $uriString"
+                    EngineStateRepository.update { it.copy(safDescriptorError = msg) }
+                    EngineStateRepository.logDiagnostic("SAF_ERR", msg)
+                    null
                 }
             } catch (e: Exception) {
-                EngineStateRepository.logDiagnostic("ERROR", "openFileDescriptor failed: ${e.javaClass.simpleName}: ${e.message}")
+                val msg = "${e.javaClass.simpleName}: ${e.message ?: "Cannot open SAF URI"}"
+                EngineStateRepository.update { it.copy(safDescriptorError = msg) }
+                EngineStateRepository.logDiagnostic("SAF_ERR", "openFileDescriptor failed: $msg")
+                null
             }
         }
+        EngineStateRepository.update { it.copy(safDescriptorError = null) }
         return uriString
     }
 
-    private fun ensureActiveModelLoadedInJni(state: EngineTelemetryState) {
+    private fun ensureActiveModelLoadedInJni(state: EngineTelemetryState): Boolean {
         if (!state.hasValidModelMounted) {
             EngineStateRepository.logDiagnostic("WARN", "ensureActiveModelLoadedInJni skipped: no valid model mounted")
-            return
+            return false
         }
-        if (lastLoadedUriString != state.activeModel.uriString) {
-            val nativePath = resolveNativePathOrFd(state.activeModel.uriString)
-            EngineStateRepository.logDiagnostic(
-                "JNI_LOAD",
-                "Loading model '${state.activeModel.id}' via path=$nativePath, ctx=${state.contextLength}, kv=${state.kvCacheQuant}"
+
+        val targetSignature = "${state.activeModel.uriString}|${state.contextLength}|${state.kvCacheQuant}|${state.mmapEnabled}"
+        if (lastLoadedSignature == targetSignature && state.jniLoadRc == 0 && state.safDescriptorError == null) {
+            return true
+        }
+
+        val nativePath = resolveNativePathOrFd(state.activeModel.uriString) ?: return false
+
+        EngineStateRepository.logDiagnostic(
+            "JNI_LOAD",
+            "Loading model '${state.activeModel.id}' via descriptor=$nativePath, n_ctx=${state.contextLength}, kv=${state.kvCacheQuant}"
+        )
+
+        val rc = LlamaBridge.nativeLoadModel(
+            modelPathOrFd = nativePath,
+            contextLength = state.contextLength,
+            batchSize = state.batchSize,
+            threads = state.effectiveActiveThreads,
+            kvCacheQuant = state.kvCacheQuant,
+            useMmap = state.mmapEnabled,
+            pinBigLittleCores = state.bigLittleCorePinning,
+            pinnedPrefixTokens = state.pinnedSystemTokens
+        )
+        val diag = runCatching { LlamaBridge.nativeGetLastLoadDiagnosis() }
+            .getOrDefault(if (rc == 0) "OK" else "JNI load failed with rc=$rc")
+
+        EngineStateRepository.update {
+            it.copy(
+                jniLoadRc = rc,
+                jniLoadDiagnosis = diag
             )
-            val rc = LlamaBridge.nativeLoadModel(
-                modelPathOrFd = nativePath,
-                contextLength = state.contextLength,
-                batchSize = state.batchSize,
-                threads = state.effectiveActiveThreads,
-                kvCacheQuant = state.kvCacheQuant,
-                useMmap = state.mmapEnabled,
-                pinBigLittleCores = state.bigLittleCorePinning,
-                pinnedPrefixTokens = state.pinnedSystemTokens
-            )
-            lastLoadedUriString = state.activeModel.uriString
-            EngineStateRepository.logDiagnostic("JNI_LOAD", "nativeLoadModel completed with rc=$rc")
+        }
+
+        if (rc == 0) {
+            lastLoadedSignature = targetSignature
+            EngineStateRepository.logDiagnostic("JNI_OK", diag)
+            return true
+        } else {
+            lastLoadedSignature = ""
+            EngineStateRepository.logDiagnostic("JNI_ERR", "nativeLoadModel failed (rc=$rc): $diag")
+            return false
         }
     }
 
-    private fun startHttpServerLoop(bindHost: String, port: Int) {
+    private fun startHttpServerLoop(bindHost: String, requestedPort: Int) {
         acceptJob?.cancel()
         runCatching { serverSocket?.close() }
 
         acceptJob = serviceScope.launch {
+            val state = EngineStateRepository.state.value
+            if (!state.hasValidModelMounted) {
+                EngineStateRepository.logDiagnostic("ERROR", "Cannot start HTTP server: no .GGUF model mounted")
+                EngineStateRepository.update { it.copy(serverRunning = false) }
+                stopServerAndService()
+                return@launch
+            }
+
+            ensureActiveModelLoadedInJni(state)
+
+            var boundSocket: ServerSocket? = null
+            var actualPort = requestedPort
+            var lastBindErr: Exception? = null
+
+            // Try requested port first, and auto-heal to requestedPort+1 or +2 if occupied
+            for (candidatePort in listOf(requestedPort, requestedPort + 1, requestedPort + 2)) {
+                try {
+                    val inetAddress = InetAddress.getByName(bindHost)
+                    val s = ServerSocket().apply {
+                        reuseAddress = true
+                        bind(InetSocketAddress(inetAddress, candidatePort), 8)
+                    }
+                    boundSocket = s
+                    actualPort = candidatePort
+                    break
+                } catch (e: Exception) {
+                    lastBindErr = e
+                    EngineStateRepository.logDiagnostic(
+                        "PORT_WARN",
+                        "Port :$candidatePort bind failed (${e.message}); trying fallback port..."
+                    )
+                }
+            }
+
+            if (boundSocket == null) {
+                val errText = "${lastBindErr?.javaClass?.simpleName ?: "BindException"}: ${lastBindErr?.message ?: "Port occupied"}"
+                EngineStateRepository.update {
+                    it.copy(
+                        serverRunning = false,
+                        portBindError = errText
+                    )
+                }
+                EngineStateRepository.logDiagnostic("HTTP_ERR", "All ports failed to bind: $errText")
+                return@launch
+            }
+
+            serverSocket = boundSocket
+            EngineStateRepository.update {
+                it.copy(
+                    serverRunning = true,
+                    port = actualPort,
+                    portBindError = null
+                )
+            }
+            EngineStateRepository.logDiagnostic(
+                "HTTP_BIND",
+                "ServerSocket listening on http://$bindHost:$actualPort/v1 (model=${state.activeModel.id})"
+            )
+
             try {
-                val state = EngineStateRepository.state.value
-                if (!state.hasValidModelMounted) {
-                    EngineStateRepository.logDiagnostic("ERROR", "Cannot start HTTP server: no .GGUF model mounted")
-                    EngineStateRepository.update { it.copy(serverRunning = false) }
-                    stopServerAndService()
-                    return@launch
-                }
-
-                ensureActiveModelLoadedInJni(state)
-
-                val inetAddress = InetAddress.getByName(bindHost)
-                val socket = ServerSocket().apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(inetAddress, port), 8)
-                }
-                serverSocket = socket
-
-                EngineStateRepository.update { it.copy(serverRunning = true) }
-                EngineStateRepository.logDiagnostic("HTTP_BIND", "ServerSocket listening on http://$bindHost:$port/v1 (model=${state.activeModel.id})")
-
                 while (isActive && serverSocket?.isClosed == false) {
                     val clientSocket = serverSocket?.accept() ?: break
                     launch {
                         runCatching {
                             handleClientSocket(clientSocket)
                         }.onFailure { err ->
-                            EngineStateRepository.logDiagnostic("HTTP_ERR", "handleClientSocket exception: ${err.javaClass.simpleName}: ${err.message}")
+                            EngineStateRepository.logDiagnostic(
+                                "HTTP_ERR",
+                                "handleClientSocket exception: ${err.javaClass.simpleName}: ${err.message}"
+                            )
                         }
                     }
                 }
             } catch (e: Exception) {
-                EngineStateRepository.logDiagnostic("HTTP_ERR", "Server loop failed: ${e.javaClass.simpleName}: ${e.message}")
+                if (isActive) {
+                    EngineStateRepository.logDiagnostic(
+                        "HTTP_ERR",
+                        "Server accept loop closed: ${e.javaClass.simpleName}: ${e.message}"
+                    )
+                }
                 EngineStateRepository.update { it.copy(serverRunning = false) }
             }
         }
@@ -247,7 +329,9 @@ class GgufServerService : Service() {
                               "kv_cache_quant": "${s.kvCacheQuant}",
                               "prefix_cache_pinning": ${s.prefixCachePinningEnabled},
                               "gbnf_json_enforced": ${s.gbnfJsonGrammarEnabled},
-                              "core_affinity_mask": "${s.coreAffinityMaskHex}"
+                              "core_affinity_mask": "${s.coreAffinityMaskHex}",
+                              "header_verified": ${model.headerVerified},
+                              "jni_diagnosis": "${s.jniLoadDiagnosis.replace("\"", "'")}"
                             }
                           }]
                         }
@@ -262,7 +346,7 @@ class GgufServerService : Service() {
                         val errorJson = """
                             {
                               "error": {
-                                "message": "Engine busy: Single-connection mutex is locked by $currentLease. Only one connection at a time is served.",
+                                "message": "Engine busy: Single-connection mutex is locked by $currentLease. SOLUTION: Wait for the active generation to finish, or tap 'Force-Release Single-Slot Mutex' in the troubleshooting banner.",
                                 "type": "single_connection_mutex_locked",
                                 "code": "single_connection_mutex_locked"
                               }
@@ -279,11 +363,31 @@ class GgufServerService : Service() {
 
                     val leaseId = "lease-" + UUID.randomUUID().toString().take(6)
                     val snapshot = EngineStateRepository.state.value
-                    ensureActiveModelLoadedInJni(snapshot)
+                    val loadedOk = ensureActiveModelLoadedInJni(snapshot)
+                    val postLoadState = EngineStateRepository.state.value
+
+                    if (!loadedOk) {
+                        EngineStateRepository.singleConnectionMutex.set(false)
+                        val health = postLoadState.diagnoseModelHealth()
+                        val errJson = """
+                            {
+                              "error": {
+                                "message": "${health.title}: ${health.preciseErrorMessage.replace("\"", "'")} PROPOSED SOLUTION: ${health.proposedSolution.replace("\"", "'")}",
+                                "type": "model_load_failed",
+                                "code": "${health.errorCode}"
+                              }
+                            }
+                        """.trimIndent()
+                        writeHttpResponse(writer, 500, "Internal Server Error", errJson)
+                        EngineStateRepository.logDiagnostic("LOAD_500", "${health.errorCode}: ${health.preciseErrorMessage}")
+                        recordAudit(method, path, clientIp, 500, "ERROR: ${health.errorCode}", 0, 0, 0.0, 0, false)
+                        return
+                    }
+
                     val enforceJson =
-                        snapshot.gbnfJsonGrammarEnabled &&
+                        postLoadState.gbnfJsonGrammarEnabled &&
                         (requestBody.contains("json_object") || requestBody.contains("json_schema") || requestBody.contains("force_gbnf"))
-                    val reusedPrefix = if (snapshot.prefixCachePinningEnabled) snapshot.pinnedSystemTokens else 0
+                    val reusedPrefix = if (postLoadState.prefixCachePinningEnabled) postLoadState.pinnedSystemTokens else 0
 
                     try {
                         EngineStateRepository.update {
@@ -299,19 +403,19 @@ class GgufServerService : Service() {
                         val t0 = System.currentTimeMillis()
                         val responseJson = LlamaBridge.nativeCompleteChat(
                             promptJson = requestBody,
-                            contextLength = snapshot.contextLength,
-                            effectiveThreads = snapshot.effectiveActiveThreads,
-                            reusePrefixCache = snapshot.prefixCachePinningEnabled,
-                            pinnedSystemTokens = snapshot.pinnedSystemTokens,
+                            contextLength = postLoadState.contextLength,
+                            effectiveThreads = postLoadState.effectiveActiveThreads,
+                            reusePrefixCache = postLoadState.prefixCachePinningEnabled,
+                            pinnedSystemTokens = postLoadState.pinnedSystemTokens,
                             enforceGbnfJson = enforceJson,
-                            gbnfSchemaName = snapshot.activeGbnfSchemaName
+                            gbnfSchemaName = postLoadState.activeGbnfSchemaName
                         )
                         val jniElapsed = System.currentTimeMillis() - t0
 
                         writeHttpResponse(writer, 200, "OK", responseJson)
                         EngineStateRepository.logDiagnostic(
                             "HTTP_200",
-                            "Served $path in ${jniElapsed}ms (model=${snapshot.activeModel.id}, gbnf=$enforceJson)"
+                            "Served $path in ${jniElapsed}ms (model=${postLoadState.activeModel.id}, gbnf=$enforceJson)"
                         )
                         EngineStateRepository.update {
                             it.copy(totalRequestsServed = it.totalRequestsServed + 1)
@@ -321,7 +425,7 @@ class GgufServerService : Service() {
                             endpoint = path,
                             clientIp = clientIp,
                             status = 200,
-                            reason = "OK (KV=${snapshot.kvCacheQuant}, n_keep=$reusedPrefix tok, GBNF=$enforceJson)",
+                            reason = "OK (KV=${postLoadState.kvCacheQuant}, n_keep=$reusedPrefix tok, GBNF=$enforceJson)",
                             promptTokens = 148,
                             completionTokens = 64,
                             tps = 31.2,
@@ -422,7 +526,7 @@ class GgufServerService : Service() {
         runCatching { LlamaBridge.nativeUnloadModel() }
         runCatching { activeModelPfd?.close() }
         activeModelPfd = null
-        lastLoadedUriString = ""
+        lastLoadedSignature = ""
         if (wakeLock?.isHeld == true) wakeLock?.release()
         EngineStateRepository.singleConnectionMutex.set(false)
         EngineStateRepository.update {

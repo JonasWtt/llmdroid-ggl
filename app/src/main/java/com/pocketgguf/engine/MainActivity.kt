@@ -87,10 +87,10 @@ import java.nio.ByteOrder
  *
  * Features:
  *  - Real Android Storage Access Framework (SAF) file picker (`OpenDocument`) & folder scanner (`OpenDocumentTree`)
- *  - Reads real DISPLAY_NAME, real byte size via `OpenableColumns`, and binary `GGUF` magic header (0x47475546)
+ *  - 5-Stage Model Load Pre-Flight & Runtime Verification with precise error messages, proposed solutions, and 1-tap auto-fixes
  *  - Real hardware temperature & RAM polling every 2 seconds via `GgufServerService.sampleDeviceHardwareSensors`
  *  - Auto-starts `GgufServerService` when a `.gguf` file is selected or when a chat message is sent
- *  - Includes direct JNI fallback in chat if loopback HTTP socket is unavailable
+ *  - Direct JNI fallback in chat if loopback HTTP socket is unavailable
  *  - Built-in expandable & 1-tap copyable Diagnostic Log viewer inside Chat and API Bridge tabs
  */
 class MainActivity : ComponentActivity() {
@@ -118,7 +118,7 @@ class MainActivity : ComponentActivity() {
                 val telemetry by EngineStateRepository.state.collectAsState()
                 val context = LocalContext.current
 
-                // Continuously sample real SoC/Battery temperature & memory every 2 seconds even before server start
+                // Continuously sample real SoC/Battery temperature & memory every 2 seconds
                 LaunchedEffect(Unit) {
                     while (isActive) {
                         GgufServerService.sampleDeviceHardwareSensors(context)
@@ -175,6 +175,62 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val handleAutoFixAction: (String) -> Unit = { action ->
+                    when (action) {
+                        "PICK_GGUF_FILE" -> safFilePickerLauncher.launch(arrayOf("*/*"))
+                        "SCAN_GGUF_FOLDER" -> safFolderPickerLauncher.launch(null)
+                        "APPLY_LOW_RAM_SAFE_PROFILE" -> {
+                            EngineStateRepository.update {
+                                it.copy(
+                                    contextLength = 2048,
+                                    kvCacheQuant = "Q4_0",
+                                    mmapEnabled = true,
+                                    batchSize = 256
+                                )
+                            }
+                            EngineStateRepository.logDiagnostic(
+                                "AUTO_FIX",
+                                "Applied Low-RAM Safe Profile (n_ctx=2048, KV=Q4_0, mmap=ON, batch=256)"
+                            )
+                            Toast.makeText(
+                                context,
+                                "Applied Low-RAM Safe Profile (n_ctx=2048, KV=Q4_0, mmap=ON)",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            startOrStopServerService(context, true)
+                        }
+                        "START_LOCAL_SERVER" -> {
+                            startOrStopServerService(context, true)
+                        }
+                        "SWITCH_FALLBACK_PORT" -> {
+                            val nextPort = telemetry.port + 1
+                            EngineStateRepository.update {
+                                it.copy(port = nextPort, portBindError = null)
+                            }
+                            EngineStateRepository.logDiagnostic(
+                                "AUTO_FIX",
+                                "Switched local server port to :$nextPort and restarting service"
+                            )
+                            startOrStopServerService(context, true)
+                        }
+                        "FORCE_RELEASE_MUTEX" -> {
+                            EngineStateRepository.singleConnectionMutex.set(false)
+                            EngineStateRepository.update {
+                                it.copy(activeLeaseId = null, activeLeaseClient = null)
+                            }
+                            EngineStateRepository.logDiagnostic(
+                                "AUTO_FIX",
+                                "Force-released single-slot mutex lock"
+                            )
+                            Toast.makeText(
+                                context,
+                                "Single-slot mutex lock released",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+
                 PocketGgufAppShell(
                     state = telemetry,
                     onToggleServer = { shouldStart ->
@@ -195,17 +251,30 @@ class MainActivity : ComponentActivity() {
                     onPickSafFolder = {
                         safFolderPickerLauncher.launch(null)
                     },
+                    onApplyAutoFix = handleAutoFixAction,
                     onMountAndCopyModelId = { model ->
-                        EngineStateRepository.update { it.copy(activeModel = model) }
-                        EngineStateRepository.logDiagnostic("MODEL", "Mounted active model '${model.id}' (${model.sizeMb} MB, GGUF v${model.ggufVersion})")
+                        EngineStateRepository.update {
+                            it.copy(
+                                activeModel = model,
+                                safDescriptorError = null,
+                                jniLoadRc = 0
+                            )
+                        }
+                        EngineStateRepository.logDiagnostic(
+                            "MODEL",
+                            "Mounted active model '${model.id}' (${model.sizeMb} MB, GGUF v${model.ggufVersion}, verified=${model.headerVerified})"
+                        )
                         saveSelectedModelUris(context)
                         copyClientModelIdToClipboard(context, model.id)
-                        // Ensure local server is running or reloaded with the newly mounted model
-                        startOrStopServerService(context, true)
+                        if (model.headerVerified) {
+                            startOrStopServerService(context, true)
+                        }
                     },
                     onRemoveModel = { model ->
                         EngineStateRepository.update { current ->
-                            val remaining = current.availableModels.filterNot { it.id == model.id && it.uriString == model.uriString }
+                            val remaining = current.availableModels.filterNot {
+                                it.id == model.id && it.uriString == model.uriString
+                            }
                             val nextActive = if (current.activeModel.id == model.id) {
                                 remaining.firstOrNull() ?: UNMOUNTED_PLACEHOLDER_MODEL
                             } else {
@@ -234,24 +303,29 @@ class MainActivity : ComponentActivity() {
             }
             current.copy(
                 activeModel = model,
-                availableModels = deduplicated
+                availableModels = deduplicated,
+                safDescriptorError = null
             )
         }
         EngineStateRepository.logDiagnostic(
             "SAF",
-            "Mounted .gguf model '${model.id}' (${model.sizeMb} MB, headerVerified=${model.headerVerified}, uri=${model.uriString})"
+            "Mounted model '${model.id}' (${model.sizeMb} MB, headerVerified=${model.headerVerified}, magic=${model.magicSignatureHex}, uri=${model.uriString})"
         )
         saveSelectedModelUris(context)
-        if (showToast) {
+        if (showToast && model.headerVerified) {
             copyClientModelIdToClipboard(context, model.id)
         }
-        // Automatically start/reload GgufServerService so the mounted model is ready for Chat immediately
-        startOrStopServerService(context, true)
+        if (model.headerVerified) {
+            // Automatically start/reload GgufServerService so the mounted model is ready for Chat immediately
+            startOrStopServerService(context, true)
+        }
     }
 
     /**
      * Queries Android ContentResolver using OpenableColumns.DISPLAY_NAME and OpenableColumns.SIZE
      * and reads the first 24 bytes of the file to verify the GGUF magic header ('G','G','U','F').
+     * If the file is corrupted or not a GGUF file, returns a GgufModelInfo with headerVerified=false
+     * and detectedNonGgufFormat populated so the UI displays a clear error message and proposed solution.
      */
     private fun inspectSafGgufUri(context: Context, uri: Uri): GgufModelInfo? {
         var displayName: String? = null
@@ -294,49 +368,78 @@ class MainActivity : ComponentActivity() {
 
         var ggufVersion = 3
         var tensorCount = 291L
+        var kvMetaCount = 24L
         var headerValid = false
+        var magicHex = "0x00000000"
+        var nonGgufFormat: String? = null
+        var safReadErr: String? = null
 
         runCatching {
             context.contentResolver.openInputStream(uri)?.use { input ->
                 val header = ByteArray(24)
                 val read = input.read(header)
-                if (read >= 4 &&
-                    header[0] == 0x47.toByte() && // 'G'
-                    header[1] == 0x47.toByte() && // 'G'
-                    header[2] == 0x55.toByte() && // 'U'
-                    header[3] == 0x46.toByte()    // 'F'
-                ) {
-                    headerValid = true
-                    if (read >= 16) {
-                        val bb = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-                        bb.int // skip magic
-                        ggufVersion = bb.int.coerceIn(1, 4)
-                        tensorCount = bb.long.coerceAtLeast(1L)
+                if (read >= 4) {
+                    val b0 = header[0].toInt() and 0xFF
+                    val b1 = header[1].toInt() and 0xFF
+                    val b2 = header[2].toInt() and 0xFF
+                    val b3 = header[3].toInt() and 0xFF
+                    magicHex = String.format("0x%02X%02X%02X%02X", b0, b1, b2, b3)
+
+                    if (b0 == 0x47 && b1 == 0x47 && b2 == 0x55 && b3 == 0x46) {
+                        headerValid = true
+                        if (read >= 24) {
+                            val bb = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
+                            bb.int // skip magic
+                            ggufVersion = bb.int
+                            tensorCount = bb.long.coerceAtLeast(0L)
+                            kvMetaCount = bb.long.coerceAtLeast(0L)
+                        }
+                    } else {
+                        val ascii = String(header, 0, 4, Charsets.US_ASCII)
+                        nonGgufFormat = when {
+                            ascii.startsWith("<!") || ascii.lowercase().startsWith("<ht") ->
+                                "HTML Web Page (likely a HuggingFace login/redirect page saved as .gguf instead of raw weights)"
+                            b0 == 0x50 && b1 == 0x4B ->
+                                "ZIP / PyTorch (.pt/.bin) / APK archive (PK header)"
+                            b0 == 0x7B ->
+                                "JSON or Safetensors metadata file (not a quantized GGUF binary)"
+                            ascii == "ggml" || ascii == "ggmf" || ascii == "ggjt" || ascii == "lmgg" ->
+                                "Legacy 2023 GGML/GGJT v1 format (pre-GGUF)"
+                            else ->
+                                "Non-GGUF binary signature ($magicHex)"
+                        }
                     }
+                } else {
+                    nonGgufFormat = "Empty or truncated file (read only $read bytes)"
                 }
             }
         }.onFailure { err ->
-            EngineStateRepository.logDiagnostic("SAF_ERR", "Header read failed for $uri: ${err.message}")
+            safReadErr = "${err.javaClass.simpleName}: ${err.message}"
+            EngineStateRepository.logDiagnostic("SAF_ERR", "Header read failed for $uri: $safReadErr")
         }
 
-        if (!headerValid && !resolvedFilename.endsWith(".gguf", ignoreCase = true)) {
-            EngineStateRepository.logDiagnostic("SAF_REJECT", "Rejected non-GGUF file: $resolvedFilename")
-            Toast.makeText(
-                context,
-                "Selected file ($resolvedFilename) does not appear to be a .gguf model.",
-                Toast.LENGTH_LONG
-            ).show()
-            return null
+        if (safReadErr != null) {
+            EngineStateRepository.update { it.copy(safDescriptorError = safReadErr) }
         }
 
         val sizeMb = if (sizeBytes > 0) {
             (sizeBytes / (1024L * 1024L)).toInt().coerceAtLeast(1)
         } else {
-            1500
+            1
         }
 
         val cleanId = toOpenAiModelId(resolvedFilename)
         val quant = inferQuantizationTag(resolvedFilename)
+        val isSplit = Regex("-0000[1-9]-of-0000[2-9]\\.gguf$", RegexOption.IGNORE_CASE)
+            .containsMatchIn(resolvedFilename)
+
+        if (!headerValid) {
+            Toast.makeText(
+                context,
+                "Invalid GGUF header in '$resolvedFilename': ${nonGgufFormat ?: magicHex}. See troubleshooting card for solution.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
 
         return GgufModelInfo(
             id = cleanId,
@@ -347,7 +450,11 @@ class MainActivity : ComponentActivity() {
             quantization = quant,
             ggufVersion = ggufVersion,
             tensorCount = tensorCount,
-            headerVerified = headerValid
+            kvMetaCount = kvMetaCount,
+            headerVerified = headerValid,
+            magicSignatureHex = magicHex,
+            detectedNonGgufFormat = nonGgufFormat,
+            isSplitShard = isSplit
         )
     }
 
@@ -431,18 +538,20 @@ class MainActivity : ComponentActivity() {
         }
 
         if (discovered.isNotEmpty()) {
+            val preferred = discovered.firstOrNull { it.headerVerified } ?: discovered.first()
             EngineStateRepository.update {
                 it.copy(
                     availableModels = discovered,
-                    activeModel = discovered.first()
+                    activeModel = preferred
                 )
             }
             EngineStateRepository.logDiagnostic(
                 "RESTORE",
-                "Restored ${discovered.size} local .gguf model(s); active='${discovered.first().id}'"
+                "Restored ${discovered.size} local .gguf model(s); active='${preferred.id}'"
             )
-            // Automatically start GgufServerService for the restored active model
-            startOrStopServerService(this, true)
+            if (preferred.headerVerified) {
+                startOrStopServerService(this, true)
+            }
         } else {
             EngineStateRepository.logDiagnostic("RESTORE", "No pre-saved .gguf URIs yet; waiting for user SAF selection.")
         }
@@ -532,12 +641,192 @@ data class LocalChatMessage(
     val isError: Boolean = false
 )
 
+/**
+ * Reusable 5-Stage Model Load Health & Error Troubleshooting Card.
+ * Displays exact error causes, proposed solutions, a 1-tap Auto-Fix button,
+ * and an expandable 5-stage pre-flight verification checklist.
+ */
+@Composable
+fun ModelLoadHealthCard(
+    state: EngineTelemetryState,
+    onApplyAutoFix: (String) -> Unit
+) {
+    val diagnosis = state.diagnoseModelHealth()
+    var showChecklist by remember { mutableStateOf(diagnosis.overallStatus != "HEALTHY") }
+
+    val borderColor = when (diagnosis.overallStatus) {
+        "ERROR" -> Color(0xFFDC2626)
+        "WARNING" -> Color(0xFFD97706)
+        else -> Color(0xFF16A34A)
+    }
+    val bgColor = when (diagnosis.overallStatus) {
+        "ERROR" -> Color(0xFFFEF2F2)
+        "WARNING" -> Color(0xFFFFFBEB)
+        else -> Color(0xFFF0FDF4)
+    }
+    val titleColor = when (diagnosis.overallStatus) {
+        "ERROR" -> Color(0xFF991B1B)
+        "WARNING" -> Color(0xFF92400E)
+        else -> Color(0xFF166534)
+    }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = bgColor,
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.5.dp, borderColor, RoundedCornerShape(12.dp))
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = when (diagnosis.overallStatus) {
+                        "ERROR" -> "✖ MODEL LOAD / RUNTIME ERROR [${diagnosis.errorCode}]"
+                        "WARNING" -> "⚠ ENGINE DIAGNOSTIC NOTICE [${diagnosis.errorCode}]"
+                        else -> "● MODEL VERIFIED & READY [${diagnosis.errorCode}]"
+                    },
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = borderColor,
+                    modifier = Modifier.weight(1f)
+                )
+
+                OutlinedButton(
+                    onClick = { showChecklist = !showChecklist },
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = if (showChecklist) "Hide 5 Checks" else "5-Stage Check",
+                        fontSize = 10.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = diagnosis.title,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                color = titleColor
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = diagnosis.preciseErrorMessage,
+                fontSize = 12.sp,
+                color = Color(0xFF1E293B)
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                color = Color.White,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, borderColor.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+            ) {
+                Column(modifier = Modifier.padding(10.dp)) {
+                    Text(
+                        text = "PROPOSED SOLUTION:",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = titleColor
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = diagnosis.proposedSolution,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFF0F172A)
+                    )
+                }
+            }
+
+            if (diagnosis.autoFixAction != "NONE" && diagnosis.autoFixButtonLabel.isNotBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { onApplyAutoFix(diagnosis.autoFixAction) },
+                    colors = ButtonDefaults.buttonColors(containerColor = borderColor),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = diagnosis.autoFixButtonLabel,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+            }
+
+            if (showChecklist) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    color = Color.White,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            text = "5-STAGE MODEL LOAD VERIFICATION CHECKLIST",
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF475569)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        diagnosis.stages.forEach { st ->
+                            Row(
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.Top,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = when (st.status) {
+                                        "PASS" -> "[PASS] ${st.label}"
+                                        "WARN" -> "[WARN] ${st.label}"
+                                        else -> "[FAIL] ${st.label}"
+                                    },
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = when (st.status) {
+                                        "PASS" -> Color(0xFF15803D)
+                                        "WARN" -> Color(0xFFB45309)
+                                        else -> Color(0xFFDC2626)
+                                    },
+                                    modifier = Modifier.weight(0.45f)
+                                )
+                                Text(
+                                    text = st.detail,
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFF334155),
+                                    modifier = Modifier.weight(0.55f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun PocketGgufAppShell(
     state: EngineTelemetryState,
     onToggleServer: (Boolean) -> Unit,
     onPickSafGguf: () -> Unit,
     onPickSafFolder: () -> Unit,
+    onApplyAutoFix: (String) -> Unit,
     onMountAndCopyModelId: (GgufModelInfo) -> Unit,
     onRemoveModel: (GgufModelInfo) -> Unit
 ) {
@@ -612,6 +901,7 @@ fun PocketGgufAppShell(
                         Text(
                             text = when {
                                 !state.hasValidModelMounted -> "NO .GGUF FILE SELECTED YET"
+                                !state.activeModel.headerVerified || state.jniLoadRc != 0 -> "✖ MODEL ERROR: ${state.activeModel.id}"
                                 state.serverRunning -> "● SERVING LIVE: ${state.activeModel.id}"
                                 else -> "◐ STANDBY: ${state.activeModel.id}"
                             },
@@ -621,7 +911,7 @@ fun PocketGgufAppShell(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             color = when {
-                                !state.hasValidModelMounted -> Color(0xFFDC2626)
+                                !state.hasValidModelMounted || !state.activeModel.headerVerified || state.jniLoadRc != 0 -> Color(0xFFDC2626)
                                 state.serverRunning -> Color(0xFF15803D)
                                 else -> Color(0xFFB45309)
                             }
@@ -696,6 +986,7 @@ fun PocketGgufAppShell(
                     selfTestResult = selfTestResult,
                     onToggleServer = onToggleServer,
                     onPickSafGguf = onPickSafGguf,
+                    onApplyAutoFix = onApplyAutoFix,
                     onRunSelfApiTest = runSelfApiTest
                 )
                 AppTab.MODELS -> ModelsVaultScreen(
@@ -705,6 +996,7 @@ fun PocketGgufAppShell(
                     selfTestResult = selfTestResult,
                     onPickSafGguf = onPickSafGguf,
                     onPickSafFolder = onPickSafFolder,
+                    onApplyAutoFix = onApplyAutoFix,
                     onMountAndCopy = { model ->
                         lastCopiedModelId = model.id
                         onMountAndCopyModelId(model)
@@ -712,7 +1004,10 @@ fun PocketGgufAppShell(
                     onRemoveModel = onRemoveModel,
                     onRunSelfApiTest = runSelfApiTest
                 )
-                AppTab.CONTEXT -> ContextTuningScreen(state = state)
+                AppTab.CONTEXT -> ContextTuningScreen(
+                    state = state,
+                    onApplyAutoFix = onApplyAutoFix
+                )
                 AppTab.BRIDGE -> ApiBridgeScreen(
                     state = state,
                     selfTestLoading = selfTestLoading,
@@ -729,7 +1024,8 @@ fun PocketGgufAppShell(
                     onQuickPrompt = { sendChatPrompt(it) },
                     onClearChat = { chatMessages = emptyList() },
                     onToggleServer = onToggleServer,
-                    onPickSafGguf = onPickSafGguf
+                    onPickSafGguf = onPickSafGguf,
+                    onApplyAutoFix = onApplyAutoFix
                 )
             }
         }
@@ -738,37 +1034,45 @@ fun PocketGgufAppShell(
 
 /**
  * Ensures the native JNI model is loaded in-process if fallback inference is needed.
+ * Uses the exact LlamaBridge.nativeLoadModel signature.
  */
-private fun ensureInProcessJniModelLoaded(context: Context, state: EngineTelemetryState) {
+private fun ensureInProcessJniModelLoaded(context: Context, state: EngineTelemetryState): Boolean {
     val active = state.activeModel
     var safPfd: ParcelFileDescriptor? = null
-    try {
+    return try {
         val loadPath = if (active.uriString.startsWith("content://")) {
             val uri = Uri.parse(active.uriString)
             safPfd = context.contentResolver.openFileDescriptor(uri, "r")
             if (safPfd != null) {
-                "/proc/self/fd/${safPfd.fd}"
+                EngineStateRepository.update { it.copy(safDescriptorError = null) }
+                "/proc/self/fd/${safPfd!!.fd}"
             } else {
-                active.filename
+                val msg = "ContentResolver.openFileDescriptor returned null for ${active.uriString}"
+                EngineStateRepository.update { it.copy(safDescriptorError = msg) }
+                return false
             }
         } else {
             active.uriString.ifBlank { active.filename }
         }
-        val kvCode = when (state.kvCacheQuant) {
-            "Q4_0" -> 2
-            "Q8_0" -> 1
-            else -> 0
-        }
-        LlamaBridge.nativeLoadModel(
-            modelPath = loadPath,
-            nCtx = state.contextLength,
-            nThreads = state.effectiveActiveThreads,
-            kvQuantType = kvCode,
-            prefixKeepTokens = if (state.prefixCachePinningEnabled) state.pinnedSystemTokens else 0,
-            coreAffinityMask = if (state.bigLittleCorePinning) 0xFC else 0xFF
+
+        val rc = LlamaBridge.nativeLoadModel(
+            modelPathOrFd = loadPath,
+            contextLength = state.contextLength,
+            batchSize = state.batchSize,
+            threads = state.effectiveActiveThreads,
+            kvCacheQuant = state.kvCacheQuant,
+            useMmap = state.mmapEnabled,
+            pinBigLittleCores = state.bigLittleCorePinning,
+            pinnedPrefixTokens = if (state.prefixCachePinningEnabled) state.pinnedSystemTokens else 0
         )
+        val diag = runCatching { LlamaBridge.nativeGetLastLoadDiagnosis() }.getOrDefault("rc=$rc")
+        EngineStateRepository.update { it.copy(jniLoadRc = rc, jniLoadDiagnosis = diag) }
+        rc == 0
     } catch (e: Exception) {
-        EngineStateRepository.logDiagnostic("JNI_LOAD_ERR", "In-process JNI model load warning: ${e.message}")
+        val errText = "${e.javaClass.simpleName}: ${e.message}"
+        EngineStateRepository.update { it.copy(safDescriptorError = errText) }
+        EngineStateRepository.logDiagnostic("JNI_LOAD_ERR", "In-process JNI model load error: $errText")
+        false
     } finally {
         runCatching { safPfd?.close() }
     }
@@ -782,9 +1086,10 @@ private suspend fun executeLocalSelfApiTest(
     context: Context,
     state: EngineTelemetryState
 ): String = withContext(Dispatchers.IO) {
-    if (!state.hasValidModelMounted) {
-        EngineStateRepository.logDiagnostic("SELF_TEST", "Aborted: No .gguf model mounted yet.")
-        return@withContext "NO MODEL MOUNTED: Tap 'Select .GGUF File from Phone' to pick a .gguf model from your storage first."
+    val precheck = state.diagnoseModelHealth()
+    if (!state.hasValidModelMounted || !state.activeModel.headerVerified) {
+        EngineStateRepository.logDiagnostic("SELF_TEST", "Aborted: ${precheck.errorCode} - ${precheck.preciseErrorMessage}")
+        return@withContext "ERROR [${precheck.errorCode}]: ${precheck.title}\n${precheck.preciseErrorMessage}\n\nPROPOSED SOLUTION:\n${precheck.proposedSolution}"
     }
 
     if (!EngineStateRepository.state.value.serverRunning) {
@@ -846,17 +1151,25 @@ private suspend fun executeLocalSelfApiTest(
             "HTTP loopback error (${e.javaClass.simpleName}: ${e.message}); testing direct JNI fallback..."
         )
         runCatching {
-            ensureInProcessJniModelLoaded(context, currentState)
+            val loaded = ensureInProcessJniModelLoaded(context, currentState)
+            if (!loaded) {
+                val diag = EngineStateRepository.state.value.diagnoseModelHealth()
+                return@withContext "ERROR [${diag.errorCode}]: ${diag.preciseErrorMessage}\nPROPOSED SOLUTION: ${diag.proposedSolution}"
+            }
             val jniBody = LlamaBridge.nativeCompleteChat(
                 promptJson = payload,
-                enforceJsonGrammar = currentState.gbnfJsonGrammarEnabled,
-                reusePinnedPrefix = currentState.prefixCachePinningEnabled
+                contextLength = currentState.contextLength,
+                effectiveThreads = currentState.effectiveActiveThreads,
+                reusePrefixCache = currentState.prefixCachePinningEnabled,
+                pinnedSystemTokens = currentState.pinnedSystemTokens,
+                enforceGbnfJson = false,
+                gbnfSchemaName = currentState.activeGbnfSchemaName
             )
             EngineStateRepository.logDiagnostic("SELF_TEST_JNI", "Direct JNI fallback succeeded (${jniBody.length} chars)")
             "DIRECT JNI FALLBACK (Socket note: ${e.message})\n$jniBody"
         }.getOrElse { jniErr ->
             EngineStateRepository.logDiagnostic("SELF_TEST_FATAL", "JNI fallback also failed: ${jniErr.message}")
-            "Local Socket & JNI Error: ${e.javaClass.simpleName}: ${e.message}"
+            "Local Socket & JNI Error: ${e.javaClass.simpleName}: ${e.message}\nPROPOSED SOLUTION: Tap 'Start Server' or re-select the .gguf file."
         }
     }
 }
@@ -868,6 +1181,7 @@ fun TelemetryScreen(
     selfTestResult: String?,
     onToggleServer: (Boolean) -> Unit,
     onPickSafGguf: () -> Unit,
+    onApplyAutoFix: (String) -> Unit,
     onRunSelfApiTest: () -> Unit
 ) {
     LazyColumn(
@@ -876,6 +1190,14 @@ fun TelemetryScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // 5-Stage Model Load Health & Troubleshooting Banner
+        item {
+            ModelLoadHealthCard(
+                state = state,
+                onApplyAutoFix = onApplyAutoFix
+            )
+        }
+
         // Primary Serving Status Banner + Select .GGUF File + Self API Test
         item {
             Surface(
@@ -926,48 +1248,6 @@ fun TelemetryScreen(
                         fontWeight = FontWeight.Bold,
                         color = Color(0xFF0F172A)
                     )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Surface(
-                        color = when {
-                            !state.hasValidModelMounted -> Color(0xFFFEF2F2)
-                            state.serverRunning -> Color(0xFFF0FDF4)
-                            else -> Color(0xFFFEF3C7)
-                        },
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Text(
-                                text = when {
-                                    !state.hasValidModelMounted -> "NO GGUF FILE SELECTED FROM PHONE STORAGE"
-                                    state.serverRunning -> "ACTIVE SERVING MODEL: ${state.activeModel.name}"
-                                    else -> "MOUNTED IN STANDBY (NOT SERVING): ${state.activeModel.name}"
-                                },
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = when {
-                                    !state.hasValidModelMounted -> Color(0xFF991B1B)
-                                    state.serverRunning -> Color(0xFF166534)
-                                    else -> Color(0xFF92400E)
-                                }
-                            )
-                            Text(
-                                text = if (state.hasValidModelMounted) {
-                                    "Client Model ID: \"${state.activeModel.id}\" · ${state.activeModel.sizeMb} MB · KV ${state.kvCacheQuant}"
-                                } else {
-                                    "Tap 'Select .GGUF File from Phone' below to browse your Downloads or Documents folder."
-                                },
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = when {
-                                    !state.hasValidModelMounted -> Color(0xFFB91C1C)
-                                    state.serverRunning -> Color(0xFF15803D)
-                                    else -> Color(0xFFB45309)
-                                }
-                            )
-                        }
-                    }
 
                     Spacer(modifier = Modifier.height(12.dp))
                     Button(
@@ -1206,6 +1486,7 @@ fun ModelsVaultScreen(
     selfTestResult: String?,
     onPickSafGguf: () -> Unit,
     onPickSafFolder: () -> Unit,
+    onApplyAutoFix: (String) -> Unit,
     onMountAndCopy: (GgufModelInfo) -> Unit,
     onRemoveModel: (GgufModelInfo) -> Unit,
     onRunSelfApiTest: () -> Unit
@@ -1216,6 +1497,14 @@ fun ModelsVaultScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // 5-Stage Model Load Health & Troubleshooting Banner
+        item {
+            ModelLoadHealthCard(
+                state = state,
+                onApplyAutoFix = onApplyAutoFix
+            )
+        }
+
         item {
             Surface(
                 shape = RoundedCornerShape(12.dp),
@@ -1332,14 +1621,16 @@ fun ModelsVaultScreen(
 
         items(state.availableModels) { model ->
             val isSelected = model.id == state.activeModel.id && state.hasValidModelMounted
-            val isActivelyServing = isSelected && state.serverRunning
+            val isActivelyServing = isSelected && state.serverRunning && model.headerVerified
 
             val statusLabel = when {
+                !model.headerVerified -> "✖ INVALID HEADER (${model.magicSignatureHex})"
                 isActivelyServing -> "● SERVING LIVE ON :${state.port}"
                 isSelected -> "◐ MOUNTED (SERVER STOPPED)"
                 else -> "○ ON PHONE (LONG-PRESS TO MOUNT & COPY ID)"
             }
             val statusColor = when {
+                !model.headerVerified -> Color(0xFFDC2626)
                 isActivelyServing -> Color(0xFF15803D)
                 isSelected -> Color(0xFFB45309)
                 else -> Color(0xFF64748B)
@@ -1352,12 +1643,11 @@ fun ModelsVaultScreen(
                     .fillMaxWidth()
                     .border(
                         width = if (isSelected) 2.dp else 1.dp,
-                        color = if (isActivelyServing) {
-                            Color(0xFF16A34A)
-                        } else if (isSelected) {
-                            Color(0xFFD97706)
-                        } else {
-                            Color(0xFFE2E8F0)
+                        color = when {
+                            !model.headerVerified -> Color(0xFFDC2626)
+                            isActivelyServing -> Color(0xFF16A34A)
+                            isSelected -> Color(0xFFD97706)
+                            else -> Color(0xFFE2E8F0)
                         },
                         shape = RoundedCornerShape(12.dp)
                     )
@@ -1448,13 +1738,23 @@ fun ModelsVaultScreen(
 }
 
 @Composable
-fun ContextTuningScreen(state: EngineTelemetryState) {
+fun ContextTuningScreen(
+    state: EngineTelemetryState,
+    onApplyAutoFix: (String) -> Unit
+) {
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        item {
+            ModelLoadHealthCard(
+                state = state,
+                onApplyAutoFix = onApplyAutoFix
+            )
+        }
+
         item {
             Surface(
                 shape = RoundedCornerShape(12.dp),
@@ -1698,6 +1998,7 @@ fun DiagnosticLogConsoleCard(
     state: EngineTelemetryState,
     context: Context
 ) {
+    val health = state.diagnoseModelHealth()
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = Color(0xFF0F172A),
@@ -1731,11 +2032,15 @@ fun DiagnosticLogConsoleCard(
                     onClick = {
                         val report = buildString {
                             appendLine("=== PocketGGUF Diagnostic Report ===")
+                            appendLine("Health Status: ${health.overallStatus} [${health.errorCode}] - ${health.title}")
+                            appendLine("Detail: ${health.preciseErrorMessage}")
+                            appendLine("Proposed Solution: ${health.proposedSolution}")
                             appendLine("Server Running: ${state.serverRunning} (127.0.0.1:${state.port})")
-                            appendLine("Active Model ID: ${state.activeModel.id} (${state.activeModel.sizeMb} MB, GGUF v${state.activeModel.ggufVersion})")
+                            appendLine("Active Model ID: ${state.activeModel.id} (${state.activeModel.sizeMb} MB, GGUF v${state.activeModel.ggufVersion}, magic=${state.activeModel.magicSignatureHex})")
                             appendLine("Model URI: ${state.activeModel.uriString}")
+                            appendLine("JNI Diagnosis: ${state.jniLoadDiagnosis}")
                             appendLine("Thermal Sensor: ${state.socTempC}°C (${state.tempSensorSource})")
-                            appendLine("Phone RAM: ${state.deviceAvailRamMb} MB free / ${state.deviceTotalRamMb} MB total")
+                            appendLine("Phone RAM: ${state.deviceAvailRamMb} MB free / ${state.deviceTotalRamMb} MB total (Required: ${state.totalAllocatedMb} MB)")
                             appendLine("KV Cache: ${state.kvCacheQuant} (${state.kvCacheMb} MB), n_ctx=${state.contextLength}")
                             appendLine("--- Recent Events ---")
                             state.diagnosticLogs.forEach { appendLine(it) }
@@ -1789,8 +2094,8 @@ fun DiagnosticLogConsoleCard(
  * Sends a multi-turn OpenAI /v1/chat/completions request directly to the local server
  * hosted by GgufServerService on http://127.0.0.1:<port>/v1/chat/completions.
  *
- * Also auto-starts GgufServerService if the model was mounted in standby, and falls back
- * to direct in-process JNI inference if the local HTTP socket fails.
+ * Performs pre-flight verification first and returns a clear, precise error message
+ * AND proposed solution if the model is invalid or fails to load.
  */
 private suspend fun executeLocalChatTurn(
     context: Context,
@@ -1798,14 +2103,20 @@ private suspend fun executeLocalChatTurn(
     history: List<LocalChatMessage>
 ): LocalChatMessage = withContext(Dispatchers.IO) {
     val t0 = System.currentTimeMillis()
+    val preFlight = state.diagnoseModelHealth()
 
-    if (!state.hasValidModelMounted) {
-        EngineStateRepository.logDiagnostic("CHAT_ERR", "Send aborted: No .GGUF model mounted.")
+    if (!state.hasValidModelMounted || !state.activeModel.headerVerified || state.safDescriptorError != null) {
+        EngineStateRepository.logDiagnostic(
+            "CHAT_PREFLIGHT_ERR",
+            "[${preFlight.errorCode}] ${preFlight.preciseErrorMessage}"
+        )
         return@withContext LocalChatMessage(
             id = "err-${System.currentTimeMillis()}",
             role = "assistant",
-            content = "No .GGUF file is mounted yet. Tap 'Select .GGUF' above to pick a model from your phone storage.",
-            modelId = "unmounted",
+            content = "✖ ${preFlight.title} [${preFlight.errorCode}]\n\n" +
+                "CAUSE:\n${preFlight.preciseErrorMessage}\n\n" +
+                "PROPOSED SOLUTION:\n${preFlight.proposedSolution}",
+            modelId = state.activeModel.id,
             latencyMs = 1L,
             isError = true
         )
@@ -1875,7 +2186,9 @@ private suspend fun executeLocalChatTurn(
         EngineStateRepository.logDiagnostic("CHAT_RES", "HTTP $code in ${elapsed}ms (${body.length} chars)")
 
         val parsed = runCatching { JSONObject(body) }.getOrNull()
-        if (code in 200..299 && parsed != null) {
+        val hasJsonError = parsed?.optJSONObject("error") != null
+
+        if (code in 200..299 && parsed != null && !hasJsonError) {
             val content = parsed
                 .optJSONArray("choices")
                 ?.optJSONObject(0)
@@ -1894,12 +2207,15 @@ private suspend fun executeLocalChatTurn(
                 isError = false
             )
         } else {
-            val errMsg = parsed?.optJSONObject("error")?.optString("message") ?: "HTTP $code: $body"
-            EngineStateRepository.logDiagnostic("CHAT_HTTP_ERR", errMsg)
+            val rawErr = parsed?.optJSONObject("error")?.optString("message") ?: "HTTP $code: $body"
+            val currentDiagnosis = EngineStateRepository.state.value.diagnoseModelHealth()
+            EngineStateRepository.logDiagnostic("CHAT_HTTP_ERR", rawErr)
             LocalChatMessage(
                 id = "err-${System.currentTimeMillis()}",
                 role = "assistant",
-                content = errMsg,
+                content = "✖ Model Inference Error (HTTP $code)\n\n" +
+                    "CAUSE:\n$rawErr\n\n" +
+                    "PROPOSED SOLUTION:\n${currentDiagnosis.proposedSolution}",
                 modelId = liveState.activeModel.id,
                 latencyMs = elapsed,
                 isError = true
@@ -1910,16 +2226,47 @@ private suspend fun executeLocalChatTurn(
             "CHAT_SOCK_ERR",
             "HTTP loopback failed (${e.javaClass.simpleName}: ${e.message}); running direct in-process JNI fallback..."
         )
-        // Direct in-process JNI fallback so the user always gets a reply even if port 8080 is blocked
+        // Direct in-process JNI fallback so the user always gets a reply or precise JNI diagnosis
         runCatching {
-            ensureInProcessJniModelLoaded(context, liveState)
+            val loaded = ensureInProcessJniModelLoaded(context, liveState)
+            if (!loaded) {
+                val diag = EngineStateRepository.state.value.diagnoseModelHealth()
+                return@withContext LocalChatMessage(
+                    id = "err-${System.currentTimeMillis()}",
+                    role = "assistant",
+                    content = "✖ ${diag.title} [${diag.errorCode}]\n\n" +
+                        "CAUSE:\n${diag.preciseErrorMessage}\n\n" +
+                        "PROPOSED SOLUTION:\n${diag.proposedSolution}",
+                    modelId = liveState.activeModel.id,
+                    latencyMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L),
+                    isError = true
+                )
+            }
+
             val jniBody = LlamaBridge.nativeCompleteChat(
                 promptJson = payloadStr,
-                enforceJsonGrammar = liveState.gbnfJsonGrammarEnabled,
-                reusePinnedPrefix = liveState.prefixCachePinningEnabled
+                contextLength = liveState.contextLength,
+                effectiveThreads = liveState.effectiveActiveThreads,
+                reusePrefixCache = liveState.prefixCachePinningEnabled,
+                pinnedSystemTokens = liveState.pinnedSystemTokens,
+                enforceGbnfJson = false,
+                gbnfSchemaName = liveState.activeGbnfSchemaName
             )
             val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
             val parsed = JSONObject(jniBody)
+            if (parsed.optJSONObject("error") != null) {
+                val errMsg = parsed.optJSONObject("error")?.optString("message") ?: jniBody
+                val diag = EngineStateRepository.state.value.diagnoseModelHealth()
+                return@withContext LocalChatMessage(
+                    id = "err-${System.currentTimeMillis()}",
+                    role = "assistant",
+                    content = "✖ Native JNI Model Load Error\n\nCAUSE:\n$errMsg\n\nPROPOSED SOLUTION:\n${diag.proposedSolution}",
+                    modelId = liveState.activeModel.id,
+                    latencyMs = elapsed,
+                    isError = true
+                )
+            }
+
             val content = parsed
                 .optJSONArray("choices")
                 ?.optJSONObject(0)
@@ -1940,6 +2287,7 @@ private suspend fun executeLocalChatTurn(
             )
         }.getOrElse { jniErr ->
             val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+            val diag = EngineStateRepository.state.value.diagnoseModelHealth()
             EngineStateRepository.logDiagnostic(
                 "CHAT_FATAL",
                 "Both HTTP socket (${e.message}) and JNI fallback (${jniErr.message}) failed."
@@ -1947,7 +2295,9 @@ private suspend fun executeLocalChatTurn(
             LocalChatMessage(
                 id = "err-${System.currentTimeMillis()}",
                 role = "assistant",
-                content = "Chat Error (${e.javaClass.simpleName}): ${e.message ?: "Failed to connect to 127.0.0.1:${liveState.port}"}. Tap 'Logs (${liveState.diagnosticLogs.size})' above to copy full diagnostics.",
+                content = "✖ Chat Execution Error (${e.javaClass.simpleName})\n\n" +
+                    "CAUSE:\nLoopback HTTP (${e.message}) and JNI fallback (${jniErr.message}) could not complete inference.\n\n" +
+                    "PROPOSED SOLUTION:\n${diag.proposedSolution}\n(Tap 'Logs (${liveState.diagnosticLogs.size})' above to copy full diagnostics.)",
                 modelId = liveState.activeModel.id,
                 latencyMs = elapsed,
                 isError = true
@@ -1967,10 +2317,12 @@ fun LocalModelChatScreen(
     onQuickPrompt: (String) -> Unit,
     onClearChat: () -> Unit,
     onToggleServer: (Boolean) -> Unit,
-    onPickSafGguf: () -> Unit
+    onPickSafGguf: () -> Unit,
+    onApplyAutoFix: (String) -> Unit
 ) {
     val context = LocalContext.current
     var showDiagnostics by remember { mutableStateOf(false) }
+    val diagnosis = state.diagnoseModelHealth()
 
     Column(
         modifier = Modifier
@@ -2058,6 +2410,15 @@ fun LocalModelChatScreen(
                     }
                 }
             }
+        }
+
+        // If any model load error or RAM warning is detected, display the Error & Proposed Solution Card right in Chat
+        if (diagnosis.overallStatus != "HEALTHY") {
+            Spacer(modifier = Modifier.height(8.dp))
+            ModelLoadHealthCard(
+                state = state,
+                onApplyAutoFix = onApplyAutoFix
+            )
         }
 
         if (showDiagnostics) {
@@ -2161,6 +2522,8 @@ fun LocalModelChatScreen(
                             Text(
                                 text = if (isUser) {
                                     "YOU"
+                                } else if (msg.isError) {
+                                    "ENGINE DIAGNOSTIC & PROPOSED SOLUTION"
                                 } else {
                                     "MODEL: ${msg.modelId}"
                                 },

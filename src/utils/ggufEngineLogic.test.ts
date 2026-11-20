@@ -4,11 +4,12 @@ import {
   INITIAL_GGUF_MODELS,
   DEFAULT_ENGINE_CONFIG,
   calculateMemoryBreakdown,
-  estimateThroughput,
   evaluateMutexAcquisition,
   evaluatePrefixCacheHit,
   compileJsonSchemaToGbnf,
   evaluateThermalGovernor,
+  inspectRawGgufHeaderBytes,
+  diagnoseModelLoadAndRuntime,
 } from './ggufEngineLogic';
 
 test('Proposal 1: KV Q4_0 cache default saves >70% KV RAM vs FP16 baseline', () => {
@@ -94,4 +95,103 @@ test('evaluateMutexAcquisition allows first connection and rejects concurrent re
   }
   assert.equal(concurrentResult.httpStatus, 429);
   assert.equal(concurrentResult.errorCode, 'single_connection_mutex_locked');
+});
+
+test('inspectRawGgufHeaderBytes verifies valid GGUF v3 binary header and detects HTML or ZIP mistakes', () => {
+  // 1. Construct a valid 24-byte GGUF v3 header (magic 'GGUF', version=3, tensors=291, kv=24)
+  const buf = new ArrayBuffer(24);
+  const view = new DataView(buf);
+  view.setUint8(0, 0x47); // 'G'
+  view.setUint8(1, 0x47); // 'G'
+  view.setUint8(2, 0x55); // 'U'
+  view.setUint8(3, 0x46); // 'F'
+  view.setUint32(4, 3, true); // version 3
+  view.setUint32(8, 291, true); // 291 tensors
+  view.setUint32(16, 24, true); // 24 kv pairs
+
+  const valid = inspectRawGgufHeaderBytes(new Uint8Array(buf), 'model-Q4_K_M.gguf', 2048 * 1024 * 1024);
+  assert.equal(valid.headerVerified, true);
+  assert.equal(valid.ggufVersion, 3);
+  assert.equal(valid.tensorCount, 291);
+  assert.equal(valid.kvMetaCount, 24);
+  assert.equal(valid.isTruncated, false);
+
+  // 2. HTML webpage saved as .gguf (starts with '<!DO')
+  const htmlBytes = new TextEncoder().encode('<!DOCTYPE html><html>Login</html>');
+  const htmlRes = inspectRawGgufHeaderBytes(htmlBytes, 'bad-download.gguf', htmlBytes.length);
+  assert.equal(htmlRes.headerVerified, false);
+  assert.ok(htmlRes.detectedNonGgufFormat?.includes('HTML Web Page'));
+
+  // 3. Multi-part split shard detection
+  const shardRes = inspectRawGgufHeaderBytes(
+    new Uint8Array(buf),
+    'DeepSeek-V4-00001-of-00003.gguf',
+    2048 * 1024 * 1024
+  );
+  assert.equal(shardRes.isSplitShard, true);
+});
+
+test('diagnoseModelLoadAndRuntime provides clear error messages and actionable solutions for OOM, bad magic, and SAF errors', () => {
+  const baseModel = INITIAL_GGUF_MODELS[1]; // Qwen 7B (4680 MB)
+
+  // Case 1: Invalid GGUF Magic Header
+  const badMagicModel = {
+    ...baseModel,
+    headerVerified: false,
+    magicSignatureHex: '0x3C21444F',
+    detectedNonGgufFormat: 'HTML Web Page (likely a HuggingFace login/redirect page saved as .gguf)',
+  };
+  const memNominal = calculateMemoryBreakdown(baseModel, DEFAULT_ENGINE_CONFIG);
+  const badMagicReport = diagnoseModelLoadAndRuntime({
+    model: badMagicModel,
+    config: DEFAULT_ENGINE_CONFIG,
+    memory: memNominal,
+    serverRunning: true,
+    activeLease: null,
+  });
+  assert.equal(badMagicReport.overallStatus, 'ERROR');
+  assert.equal(badMagicReport.code, 'ERR_INVALID_GGUF_MAGIC');
+  assert.ok(badMagicReport.preciseErrorMessage.includes('HTML Web Page'));
+  assert.ok(badMagicReport.proposedSolution.includes('.gguf'));
+  assert.equal(badMagicReport.autoFixAction, 'PICK_GGUF_FILE');
+
+  // Case 2: Critical OOM RAM Exceeded (e.g. 9B 5832 MB model + 32k FP16 KV on 8 GB phone)
+  const hugeModel = {
+    ...baseModel,
+    name: 'DeepSeek-V4-Pro-Qwen3.5-9B-Q4_K_M',
+    fileSizeMb: 5832,
+  };
+  const highCtxConfig = {
+    ...DEFAULT_ENGINE_CONFIG,
+    contextLength: 32768,
+    kvCacheQuant: 'FP16' as const,
+  };
+  const oomMemory = calculateMemoryBreakdown(hugeModel, highCtxConfig, 8192, 3840);
+  assert.equal(oomMemory.oomRisk, 'CRITICAL_OOM');
+
+  const oomReport = diagnoseModelLoadAndRuntime({
+    model: hugeModel,
+    config: highCtxConfig,
+    memory: oomMemory,
+    serverRunning: true,
+    activeLease: null,
+  });
+  assert.equal(oomReport.overallStatus, 'ERROR');
+  assert.equal(oomReport.code, 'ERR_OOM_RAM_EXCEEDED');
+  assert.ok(oomReport.preciseErrorMessage.includes('exceeds safe engine memory'));
+  assert.ok(oomReport.proposedSolution.includes('Q4_0'));
+  assert.equal(oomReport.autoFixAction, 'APPLY_LOW_RAM_SAFE_PROFILE');
+
+  // Case 3: Healthy Ready Model
+  const healthyMem = calculateMemoryBreakdown(INITIAL_GGUF_MODELS[0], DEFAULT_ENGINE_CONFIG);
+  const healthyReport = diagnoseModelLoadAndRuntime({
+    model: INITIAL_GGUF_MODELS[0],
+    config: DEFAULT_ENGINE_CONFIG,
+    memory: healthyMem,
+    serverRunning: true,
+    activeLease: null,
+  });
+  assert.equal(healthyReport.overallStatus, 'HEALTHY');
+  assert.equal(healthyReport.code, 'OK_READY');
+  assert.equal(healthyReport.stages.every((s) => s.status === 'PASS'), true);
 });

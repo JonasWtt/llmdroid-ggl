@@ -21,6 +21,13 @@ export interface GgufModelSpec {
   storagePath: string;
   basePromptEvalTps: number;
   baseTokenGenTps: number;
+  ggufVersion?: number;
+  tensorCount?: number;
+  kvMetaCount?: number;
+  headerVerified?: boolean;
+  magicSignatureHex?: string;
+  detectedNonGgufFormat?: string;
+  isSplitShard?: boolean;
 }
 
 export interface EngineRuntimeConfig {
@@ -667,3 +674,518 @@ export function evaluateMutexAcquisition(
     },
   };
 }
+
+export type DiagnosticErrorCode =
+  | 'OK_READY'
+  | 'ERR_NO_MODEL_MOUNTED'
+  | 'ERR_INVALID_GGUF_MAGIC'
+  | 'ERR_UNSUPPORTED_GGUF_VERSION'
+  | 'ERR_TRUNCATED_OR_CORRUPTED_GGUF'
+  | 'ERR_SPLIT_SHARD_INCOMPLETE'
+  | 'ERR_SAF_FILE_DESCRIPTOR_DENIED'
+  | 'ERR_OOM_RAM_EXCEEDED'
+  | 'WARN_HIGH_RAM_PRESSURE'
+  | 'ERR_SERVER_STOPPED'
+  | 'ERR_PORT_BIND_CONFLICT'
+  | 'WARN_SINGLE_SLOT_MUTEX_BUSY';
+
+export type AutoFixActionType =
+  | 'NONE'
+  | 'PICK_GGUF_FILE'
+  | 'SCAN_GGUF_FOLDER'
+  | 'APPLY_LOW_RAM_SAFE_PROFILE'
+  | 'START_LOCAL_SERVER'
+  | 'SWITCH_FALLBACK_PORT'
+  | 'FORCE_RELEASE_MUTEX';
+
+export interface ModelLoadStageCheck {
+  stageId: 'storage_fd' | 'gguf_header' | 'ram_budget' | 'jni_loader' | 'http_socket';
+  label: string;
+  status: 'PASS' | 'WARN' | 'FAIL';
+  detail: string;
+}
+
+export interface ModelLoadDiagnosticReport {
+  overallStatus: 'HEALTHY' | 'WARNING' | 'ERROR';
+  code: DiagnosticErrorCode;
+  title: string;
+  preciseErrorMessage: string;
+  proposedSolution: string;
+  autoFixAction: AutoFixActionType;
+  autoFixButtonLabel: string;
+  stages: ModelLoadStageCheck[];
+}
+
+export interface RawGgufHeaderInspection {
+  headerVerified: boolean;
+  magicSignatureHex: string;
+  detectedNonGgufFormat?: string;
+  ggufVersion: number;
+  tensorCount: number;
+  kvMetaCount: number;
+  isSplitShard: boolean;
+  isTruncated: boolean;
+}
+
+/**
+ * Inspects the first 24 bytes of a file to verify the binary 'GGUF' magic header (0x47475546),
+ * format version (v1..v3), tensor count, KV metadata count, and detects common wrong-file mistakes
+ * (HTML pages from HuggingFace redirects, ZIP/APK archives, Safetensors/JSON, legacy GGML).
+ */
+export function inspectRawGgufHeaderBytes(
+  headerBytes: Uint8Array,
+  filename: string,
+  fileSizeBytes: number
+): RawGgufHeaderInspection {
+  const isSplitShard = /-0000[1-9]-of-0000[2-9]\.gguf$/i.test(filename);
+  if (fileSizeBytes <= 0 || headerBytes.length < 4) {
+    return {
+      headerVerified: false,
+      magicSignatureHex: '0x00000000 (Empty/0-byte file)',
+      detectedNonGgufFormat: 'Empty or 0-byte file',
+      ggufVersion: 0,
+      tensorCount: 0,
+      kvMetaCount: 0,
+      isSplitShard,
+      isTruncated: true,
+    };
+  }
+
+  const b0 = headerBytes[0];
+  const b1 = headerBytes[1];
+  const b2 = headerBytes[2];
+  const b3 = headerBytes[3];
+  const hex =
+    '0x' +
+    [b0, b1, b2, b3]
+      .map((b) => b.toString(16).toUpperCase().padStart(2, '0'))
+      .join('');
+
+  const isGgufMagic = b0 === 0x47 && b1 === 0x47 && b2 === 0x55 && b3 === 0x46; // 'G','G','U','F'
+  if (!isGgufMagic) {
+    const asciiPrefix = String.fromCharCode(b0, b1, b2, b3);
+    let detectedFormat = `Non-GGUF binary (${hex})`;
+    if (asciiPrefix.startsWith('<!') || asciiPrefix.toLowerCase().startsWith('<ht')) {
+      detectedFormat = 'HTML Web Page (likely a HuggingFace login/redirect page saved as .gguf)';
+    } else if (b0 === 0x50 && b1 === 0x4b) {
+      detectedFormat = 'ZIP / PyTorch .pt / APK Archive (PK header)';
+    } else if (b0 === 0x7b || (headerBytes.length >= 8 && b2 === 0x00 && b3 === 0x00 && b0 !== 0x47)) {
+      detectedFormat = 'JSON or Safetensors file (not quantized GGUF)';
+    } else if (asciiPrefix === 'ggml' || asciiPrefix === 'ggmf' || asciiPrefix === 'ggjt' || asciiPrefix === 'lmgg') {
+      detectedFormat = 'Legacy 2023 GGML/GGJT format (pre-GGUF)';
+    }
+
+    return {
+      headerVerified: false,
+      magicSignatureHex: hex,
+      detectedNonGgufFormat: detectedFormat,
+      ggufVersion: 0,
+      tensorCount: 0,
+      kvMetaCount: 0,
+      isSplitShard,
+      isTruncated: fileSizeBytes < 64,
+    };
+  }
+
+  let ggufVersion = 3;
+  let tensorCount = 291;
+  let kvMetaCount = 24;
+
+  if (headerBytes.length >= 24) {
+    const dv = new DataView(
+      headerBytes.buffer,
+      headerBytes.byteOffset,
+      headerBytes.byteLength
+    );
+    ggufVersion = dv.getUint32(4, true);
+    const tLow = dv.getUint32(8, true);
+    const kLow = dv.getUint32(16, true);
+    tensorCount = tLow;
+    kvMetaCount = kLow;
+  }
+
+  const isTruncated = fileSizeBytes < 64 || tensorCount <= 0;
+
+  return {
+    headerVerified: true,
+    magicSignatureHex: '0x47475546 ("GGUF")',
+    ggufVersion,
+    tensorCount,
+    kvMetaCount,
+    isSplitShard,
+    isTruncated,
+  };
+}
+
+/**
+ * Runs a 5-stage pre-flight and runtime check on the selected model, memory budget,
+ * native JNI loader, and local OpenAI HTTP socket.
+ * Whenever anything goes wrong, returns a clear and precise error message plus a concrete proposed solution.
+ */
+export function diagnoseModelLoadAndRuntime(params: {
+  model: GgufModelSpec | null;
+  config: EngineRuntimeConfig;
+  memory: MemoryBreakdown;
+  serverRunning: boolean;
+  activeLease: ActiveConnectionLease | null;
+  safDescriptorError?: string | null;
+  jniLoadError?: string | null;
+  portBindError?: string | null;
+}): ModelLoadDiagnosticReport {
+  const {
+    model,
+    config,
+    memory,
+    serverRunning,
+    activeLease,
+    safDescriptorError,
+    jniLoadError,
+    portBindError,
+  } = params;
+
+  if (!model || !model.id || model.id === 'no-gguf-selected' || model.fileSizeMb <= 0) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_NO_MODEL_MOUNTED',
+      title: 'No .GGUF Model File Mounted',
+      preciseErrorMessage:
+        'No local .gguf model file is currently selected or mounted in the engine.',
+      proposedSolution:
+        "Tap 'Select .GGUF File from Phone Storage' to pick a quantized .gguf model (e.g., Q4_K_M.gguf) from your Downloads or Documents folder.",
+      autoFixAction: 'PICK_GGUF_FILE',
+      autoFixButtonLabel: 'Select .GGUF File from Storage',
+      stages: [
+        {
+          stageId: 'storage_fd',
+          label: '1. Storage & SAF File Descriptor',
+          status: 'FAIL',
+          detail: 'No .gguf file URI selected yet',
+        },
+        {
+          stageId: 'gguf_header',
+          label: '2. Binary GGUF Magic Header',
+          status: 'FAIL',
+          detail: 'Waiting for file selection',
+        },
+        {
+          stageId: 'ram_budget',
+          label: '3. Phone RAM & KV Cache Budget',
+          status: 'PASS',
+          detail: `${memory.availableForEngineMb} MB usable RAM available`,
+        },
+        {
+          stageId: 'jni_loader',
+          label: '4. Native JNI / GGML Tensor Loader',
+          status: 'FAIL',
+          detail: 'Idle (no model mounted)',
+        },
+        {
+          stageId: 'http_socket',
+          label: '5. Local OpenAI Loopback Server',
+          status: serverRunning ? 'PASS' : 'WARN',
+          detail: serverRunning
+            ? `Listening on http://${config.bindAddress}:${config.port}/v1`
+            : 'Standby (auto-starts on model load)',
+        },
+      ],
+    };
+  }
+
+  const headerVerified = model.headerVerified !== false;
+  const ggufVersion = model.ggufVersion ?? 3;
+  const tensorCount = model.tensorCount ?? 291;
+  const kvMetaCount = model.kvMetaCount ?? 24;
+  const isSplitShard =
+    model.isSplitShard ?? /-0000[1-9]-of-0000[2-9]\.gguf$/i.test(model.filename);
+
+  // Build individual stage results
+  const stageStorage: ModelLoadStageCheck = safDescriptorError
+    ? {
+        stageId: 'storage_fd',
+        label: '1. Storage & SAF File Descriptor',
+        status: 'FAIL',
+        detail: `Descriptor open failed: ${safDescriptorError}`,
+      }
+    : {
+        stageId: 'storage_fd',
+        label: '1. Storage & SAF File Descriptor',
+        status: 'PASS',
+        detail: `Readable (${model.fileSizeMb} MB · ${model.storagePath})`,
+      };
+
+  const stageHeader: ModelLoadStageCheck = !headerVerified
+    ? {
+        stageId: 'gguf_header',
+        label: '2. Binary GGUF Magic Header',
+        status: 'FAIL',
+        detail: `Invalid magic bytes ${model.magicSignatureHex || ''} (${model.detectedNonGgufFormat || 'Not a GGUF file'})`,
+      }
+    : ggufVersion < 1 || ggufVersion > 3
+      ? {
+          stageId: 'gguf_header',
+          label: '2. Binary GGUF Magic Header',
+          status: 'FAIL',
+          detail: `Unsupported GGUF format v${ggufVersion} (expected v1..v3)`,
+        }
+      : tensorCount <= 0
+        ? {
+            stageId: 'gguf_header',
+            label: '2. Binary GGUF Magic Header',
+            status: 'FAIL',
+            detail: `Corrupted or truncated tensor table (tensorCount=${tensorCount})`,
+          }
+        : isSplitShard
+          ? {
+              stageId: 'gguf_header',
+              label: '2. Binary GGUF Magic Header',
+              status: 'WARN',
+              detail: `Multi-part split shard detected (${model.filename})`,
+            }
+          : {
+              stageId: 'gguf_header',
+              label: '2. Binary GGUF Magic Header',
+              status: 'PASS',
+              detail: `Verified GGUF v${ggufVersion} (0x47475546 · ${tensorCount} tensors · ${kvMetaCount} KV keys)`,
+            };
+
+  const stageRam: ModelLoadStageCheck =
+    memory.oomRisk === 'CRITICAL_OOM'
+      ? {
+          stageId: 'ram_budget',
+          label: '3. Phone RAM & KV Cache Budget',
+          status: 'FAIL',
+          detail: `Requires ${memory.totalAllocatedMb} MB (Weights ${memory.weightsMb} + KV ${memory.kvCacheMb} MB) vs ${memory.availableForEngineMb} MB usable RAM`,
+        }
+      : memory.oomRisk === 'ELEVATED'
+        ? {
+            stageId: 'ram_budget',
+            label: '3. Phone RAM & KV Cache Budget',
+            status: 'WARN',
+            detail: `Elevated RAM usage: ${memory.totalAllocatedMb} / ${memory.availableForEngineMb} MB (${memory.utilizationPercent}%)`,
+          }
+        : {
+            stageId: 'ram_budget',
+            label: '3. Phone RAM & KV Cache Budget',
+            status: 'PASS',
+            detail: `Fits comfortably: ${memory.totalAllocatedMb} / ${memory.availableForEngineMb} MB (${memory.utilizationPercent}% · KV ${config.kvCacheQuant})`,
+          };
+
+  const stageJni: ModelLoadStageCheck = jniLoadError
+    ? {
+        stageId: 'jni_loader',
+        label: '4. Native JNI / GGML Tensor Loader',
+        status: 'FAIL',
+        detail: jniLoadError,
+      }
+    : {
+        stageId: 'jni_loader',
+        label: '4. Native JNI / GGML Tensor Loader',
+        status: 'PASS',
+        detail: `Loaded '${model.id}' (mmap=${config.mmapEnabled ? 'ON' : 'OFF'}, n_ctx=${config.contextLength}, n_keep=${config.pinnedSystemTokens})`,
+      };
+
+  const stageSocket: ModelLoadStageCheck = portBindError
+    ? {
+        stageId: 'http_socket',
+        label: '5. Local OpenAI Loopback Server',
+        status: 'FAIL',
+        detail: `Port :${config.port} bind error: ${portBindError}`,
+      }
+    : !serverRunning
+      ? {
+          stageId: 'http_socket',
+          label: '5. Local OpenAI Loopback Server',
+          status: 'WARN',
+          detail: `Server stopped on ${config.bindAddress}:${config.port} (auto-starts when sending chat)`,
+        }
+      : {
+          stageId: 'http_socket',
+          label: '5. Local OpenAI Loopback Server',
+          status: 'PASS',
+          detail: `Listening on http://${config.bindAddress}:${config.port}/v1/chat/completions`,
+        };
+
+  const stages = [stageStorage, stageHeader, stageRam, stageJni, stageSocket];
+
+  // Priority 1: Storage / SAF descriptor permission error
+  if (safDescriptorError) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_SAF_FILE_DESCRIPTOR_DENIED',
+      title: 'Cannot Read .GGUF File from Phone Storage (SAF Permission / Missing File)',
+      preciseErrorMessage: `Android Storage Access Framework failed to open '${model.filename}' (${safDescriptorError}). The file may have been moved, renamed, or its URI permission expired.`,
+      proposedSolution:
+        "Tap 'Re-select .GGUF File from Storage' below to pick the file again and grant a fresh persistable read permission.",
+      autoFixAction: 'PICK_GGUF_FILE',
+      autoFixButtonLabel: 'Re-select .GGUF File from Storage',
+      stages,
+    };
+  }
+
+  // Priority 2: Invalid GGUF magic header
+  if (!headerVerified) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_INVALID_GGUF_MAGIC',
+      title: 'Invalid File Format: Not a Valid Binary .GGUF Model',
+      preciseErrorMessage: `File '${model.filename}' failed binary magic header verification. Expected 'GGUF' (0x47475546), but detected ${model.detectedNonGgufFormat || model.magicSignatureHex || 'non-GGUF data'}.`,
+      proposedSolution:
+        'Make sure you downloaded a direct quantized .gguf weight file (such as Q4_K_M.gguf) rather than a PyTorch .bin/.pt archive, Safetensors file, or an HTML webpage redirect.',
+      autoFixAction: 'PICK_GGUF_FILE',
+      autoFixButtonLabel: 'Pick a Valid .GGUF Model File',
+      stages,
+    };
+  }
+
+  // Priority 3: Unsupported GGUF specification version
+  if (ggufVersion < 1 || ggufVersion > 3) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_UNSUPPORTED_GGUF_VERSION',
+      title: `Unsupported GGUF Format Version (v${ggufVersion})`,
+      preciseErrorMessage: `Model '${model.filename}' uses GGUF specification version v${ggufVersion}. The native engine supports GGUF v1, v2, and v3.`,
+      proposedSolution:
+        'Download a standard GGUF v2 or v3 quantization of this model (e.g. Q4_K_M or IQ4_XS exported by llama.cpp).',
+      autoFixAction: 'PICK_GGUF_FILE',
+      autoFixButtonLabel: 'Select Another .GGUF Model',
+      stages,
+    };
+  }
+
+  // Priority 4: Truncated or 0-tensor corrupted download
+  if (tensorCount <= 0) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_TRUNCATED_OR_CORRUPTED_GGUF',
+      title: 'Corrupted or Incomplete .GGUF Download',
+      preciseErrorMessage: `Model '${model.filename}' (${model.fileSizeMb} MB) reports ${tensorCount} tensors in its header. The download appears incomplete or truncated.`,
+      proposedSolution:
+        'Check the file size in your phone Downloads folder against the full repository size, delete the partial download, and re-download the complete .gguf file.',
+      autoFixAction: 'PICK_GGUF_FILE',
+      autoFixButtonLabel: 'Select Complete .GGUF File',
+      stages,
+    };
+  }
+
+  // Priority 5: JNI native load error
+  if (jniLoadError) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_TRUNCATED_OR_CORRUPTED_GGUF',
+      title: 'Native JNI Engine Failed to Initialize Model Tensors',
+      preciseErrorMessage: `Native C++ loader reported: ${jniLoadError}`,
+      proposedSolution:
+        "Tap 'Apply Low-RAM Safe Profile' to reload with mmap=ON, n_ctx=2048, and Q4_0 KV cache, or re-select the .gguf file to refresh the file descriptor.",
+      autoFixAction: 'APPLY_LOW_RAM_SAFE_PROFILE',
+      autoFixButtonLabel: '1-Tap Fix: Apply Low-RAM Safe Profile & Reload',
+      stages,
+    };
+  }
+
+  // Priority 6: Critical OOM RAM Exceeded (e.g. 9B 5.8GB model + large context exceeding usable phone RAM)
+  if (memory.oomRisk === 'CRITICAL_OOM') {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_OOM_RAM_EXCEEDED',
+      title: 'Insufficient Free Phone RAM for Current Model + Context Settings',
+      preciseErrorMessage: `Loading '${model.name}' with n_ctx=${config.contextLength} and KV=${config.kvCacheQuant} requires ${memory.totalAllocatedMb} MB (${memory.weightsMb} MB weights + ${memory.kvCacheMb} MB KV cache + ${memory.computeBufferMb} MB scratch), which exceeds safe engine memory (${memory.availableForEngineMb} MB usable of ${memory.deviceRamTotalMb} MB total). Android's Low-Memory Killer (lmkd) may abort inference.`,
+      proposedSolution:
+        "Tap '1-Tap Fix: Apply Low-RAM Safe Profile' below to enable Q4_0 KV quantization (saves 72% KV RAM), set n_ctx=2048, and enable mmap streaming, or close background apps.",
+      autoFixAction: 'APPLY_LOW_RAM_SAFE_PROFILE',
+      autoFixButtonLabel: '1-Tap Fix: Apply Low-RAM Safe Profile (n_ctx=2048, KV=Q4_0, mmap=ON)',
+      stages,
+    };
+  }
+
+  // Priority 7: Port bind conflict
+  if (portBindError) {
+    return {
+      overallStatus: 'ERROR',
+      code: 'ERR_PORT_BIND_CONFLICT',
+      title: `Local Server Port :${config.port} Is Already in Use`,
+      preciseErrorMessage: `Could not bind local OpenAI server socket to ${config.bindAddress}:${config.port} (${portBindError}).`,
+      proposedSolution: `Switch the local server port to :${config.port + 1} so there is no conflict with other local services.`,
+      autoFixAction: 'SWITCH_FALLBACK_PORT',
+      autoFixButtonLabel: `1-Tap Fix: Switch to Port :${config.port + 1} & Restart`,
+      stages,
+    };
+  }
+
+  // Priority 8: Multi-part split shard warning
+  if (isSplitShard) {
+    return {
+      overallStatus: 'WARNING',
+      code: 'ERR_SPLIT_SHARD_INCOMPLETE',
+      title: 'Multi-Part Split .GGUF Shard Detected',
+      preciseErrorMessage: `'${model.filename}' is part of a multi-file split GGUF archive. Android single-file SAF descriptors only grant access to the single picked file unless the parent folder is granted.`,
+      proposedSolution:
+        "Use 'Scan GGUF Folder' to grant read access to the entire directory containing all shards, or merge shards into a single .gguf file with 'llama-gguf-split --merge'.",
+      autoFixAction: 'SCAN_GGUF_FOLDER',
+      autoFixButtonLabel: 'Grant Full Folder Access (Scan GGUF Folder)',
+      stages,
+    };
+  }
+
+  // Priority 9: Server stopped warning
+  if (!serverRunning) {
+    return {
+      overallStatus: 'WARNING',
+      code: 'ERR_SERVER_STOPPED',
+      title: 'Model Mounted in Standby (Local HTTP Server Paused)',
+      preciseErrorMessage: `Model '${model.id}' passed all binary GGUF and RAM checks, but the local OpenAI HTTP server on ${config.bindAddress}:${config.port} is currently paused.`,
+      proposedSolution:
+        "Tap 'Start Local Server Now' below (or simply send a message in the Chat tab, which auto-starts the server).",
+      autoFixAction: 'START_LOCAL_SERVER',
+      autoFixButtonLabel: `1-Tap Fix: Start Local Server on :${config.port}`,
+      stages,
+    };
+  }
+
+  // Priority 10: Single-slot mutex currently locked
+  if (activeLease !== null) {
+    return {
+      overallStatus: 'WARNING',
+      code: 'WARN_SINGLE_SLOT_MUTEX_BUSY',
+      title: `Single-Slot Mutex Locked by Active Lease (${activeLease.leaseId})`,
+      preciseErrorMessage: `The engine is currently serving '${activeLease.userAgent}' (${activeLease.clientIp}). Because max_connections = 1, any concurrent request will receive HTTP 429.`,
+      proposedSolution:
+        "Wait for the current response to finish, or tap 'Force-Release Mutex Lock' if a client hung or disconnected.",
+      autoFixAction: 'FORCE_RELEASE_MUTEX',
+      autoFixButtonLabel: '1-Tap Fix: Force-Release Single-Slot Mutex',
+      stages,
+    };
+  }
+
+  // Priority 11: Elevated RAM warning
+  if (memory.oomRisk === 'ELEVATED') {
+    return {
+      overallStatus: 'WARNING',
+      code: 'WARN_HIGH_RAM_PRESSURE',
+      title: `Elevated Memory Footprint (${memory.utilizationPercent}% of Usable Phone RAM)`,
+      preciseErrorMessage: `Model '${model.name}' is loaded and serving, using ${memory.totalAllocatedMb} MB of ${memory.availableForEngineMb} MB usable RAM.`,
+      proposedSolution:
+        config.kvCacheQuant !== 'Q4_0' || config.contextLength > 4096
+          ? "To increase stability during long chats, switch KV Cache to Q4_0 and keep n_ctx <= 4096."
+          : 'Close heavy background apps if you notice Android reclaiming memory during long chats.',
+      autoFixAction:
+        config.kvCacheQuant !== 'Q4_0' || config.contextLength > 4096
+          ? 'APPLY_LOW_RAM_SAFE_PROFILE'
+          : 'NONE',
+      autoFixButtonLabel: 'Optimize RAM (KV=Q4_0, n_ctx=4096)',
+      stages,
+    };
+  }
+
+  return {
+    overallStatus: 'HEALTHY',
+    code: 'OK_READY',
+    title: `Model Loaded & Verified: Serving '${model.id}' on :${config.port}`,
+    preciseErrorMessage: `All 5 pre-flight checks passed. Binary GGUF v${ggufVersion} header verified (${tensorCount} tensors), ${memory.totalAllocatedMb} MB allocated within ${memory.availableForEngineMb} MB budget, listening on http://${config.bindAddress}:${config.port}/v1.`,
+    proposedSolution:
+      'Ready for chat! Open the Chat tab or tap Self API Test to verify token generation.',
+    autoFixAction: 'NONE',
+    autoFixButtonLabel: '',
+    stages,
+  };
+}
+

@@ -2,9 +2,12 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <mutex>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <cstdlib>
 #include <sched.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -12,6 +15,7 @@
 
 #define LOG_TAG "PocketGGUF_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
     std::mutex g_engine_mutex;
@@ -28,12 +32,15 @@ namespace {
     // Proposal 4: Big.LITTLE core pinning
     bool g_pin_big_little = true;
 
-    // Real binary header metadata read from the mounted .gguf file descriptor
+    // Real binary header metadata & diagnostic state read from the mounted .gguf file descriptor
     uint32_t g_gguf_version = 3;
     uint64_t g_gguf_tensor_count = 0;
     uint64_t g_gguf_kv_count = 0;
+    long long g_gguf_file_size_bytes = 0;
     long long g_gguf_file_size_mb = 0;
     bool g_gguf_header_verified = false;
+    int g_last_load_rc = -1;
+    std::string g_last_load_diagnosis = "No model loaded in native JNI bridge yet.";
 
     /**
      * Proposal 4: Pins current native worker threads strictly to Prime (Cortex-X4)
@@ -67,48 +74,172 @@ namespace {
         return nKeepSystemTokens + static_cast<int>(matchLen / 4);
     }
 
+    std::string formatMagicHex(const uint8_t* bytes) {
+        std::ostringstream oss;
+        oss << "0x" << std::uppercase << std::hex << std::setfill('0')
+            << std::setw(2) << static_cast<int>(bytes[0])
+            << std::setw(2) << static_cast<int>(bytes[1])
+            << std::setw(2) << static_cast<int>(bytes[2])
+            << std::setw(2) << static_cast<int>(bytes[3]);
+        return oss.str();
+    }
+
+    std::string detectWrongFileFormat(const uint8_t* b) {
+        if ((b[0] == '<' && b[1] == '!') || (b[0] == '<' && (b[1] == 'h' || b[1] == 'H'))) {
+            return "HTML Webpage (likely a HuggingFace login or redirect page saved as .gguf instead of raw weights)";
+        }
+        if (b[0] == 0x50 && b[1] == 0x4B) {
+            return "ZIP / PyTorch (.pt/.bin) / APK archive (starts with PK zip header)";
+        }
+        if (b[0] == '{' || (b[2] == 0x00 && b[3] == 0x00 && b[0] != 0x47)) {
+            return "JSON or Safetensors file (not a quantized GGUF binary)";
+        }
+        if (b[0] == 'g' && b[1] == 'g' && (b[2] == 'm' || b[2] == 'j')) {
+            return "Legacy 2023 GGML/GGJT format (pre-GGUF v1 format)";
+        }
+        return "Non-GGUF binary file (" + formatMagicHex(b) + ")";
+    }
+
     /**
-     * Inspects the real binary GGUF header from /proc/self/fd/<fd> or filesystem path
+     * Inspects and validates the real binary GGUF header from /proc/self/fd/<fd>
+     * (using POSIX fstat + pread on the open file descriptor to avoid Android SELinux symlink denials)
+     * or from a standard filesystem path.
+     *
+     * Populates g_last_load_rc and g_last_load_diagnosis with a precise error message and proposed solution.
      */
-    void inspectBinaryGgufHeader(const std::string& pathOrFd) {
+    int inspectAndVerifyBinaryGgufHeader(const std::string& pathOrFd) {
         g_gguf_header_verified = false;
         g_gguf_tensor_count = 0;
         g_gguf_kv_count = 0;
+        g_gguf_file_size_bytes = 0;
         g_gguf_file_size_mb = 0;
 
-        struct stat st;
-        if (stat(pathOrFd.c_str(), &st) == 0 && st.st_size > 0) {
-            g_gguf_file_size_mb = static_cast<long long>(st.st_size / (1024LL * 1024LL));
+        if (pathOrFd.empty()) {
+            g_last_load_rc = -1;
+            g_last_load_diagnosis =
+                "ERROR [-1] No model file path or SAF descriptor provided. "
+                "SOLUTION: Tap 'Select .GGUF File from Phone Storage' to pick a valid .gguf file.";
+            return g_last_load_rc;
         }
 
-        std::ifstream file(pathOrFd, std::ios::binary);
-        if (!file.is_open()) return;
+        uint8_t headerBuf[24];
+        std::memset(headerBuf, 0, sizeof(headerBuf));
+        ssize_t bytesRead = -1;
 
-        if (g_gguf_file_size_mb <= 0) {
-            file.seekg(0, std::ios::end);
-            std::streampos endPos = file.tellg();
-            if (endPos > 0) {
-                g_gguf_file_size_mb = static_cast<long long>(endPos) / (1024LL * 1024LL);
-            }
-            file.seekg(0, std::ios::beg);
-        }
-
-        char magic[4] = {0, 0, 0, 0};
-        file.read(magic, 4);
-        if (file.gcount() == 4 && magic[0] == 'G' && magic[1] == 'G' && magic[2] == 'U' && magic[3] == 'F') {
-            g_gguf_header_verified = true;
-            uint32_t version = 3;
-            uint64_t tensors = 0;
-            uint64_t kvCount = 0;
-            file.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
-            file.read(reinterpret_cast<char*>(&tensors), sizeof(uint64_t));
-            file.read(reinterpret_cast<char*>(&kvCount), sizeof(uint64_t));
-            if (file) {
-                g_gguf_version = version;
-                g_gguf_tensor_count = tensors;
-                g_gguf_kv_count = kvCount;
+        // 1. If path is /proc/self/fd/<N>, read directly from integer FD via fstat + pread(fd, ..., 0)
+        // This avoids Android SELinux path-resolution EACCES on DownloadsProvider FDs!
+        const std::string fdPrefix = "/proc/self/fd/";
+        if (pathOrFd.compare(0, fdPrefix.size(), fdPrefix) == 0) {
+            int fd = std::atoi(pathOrFd.c_str() + fdPrefix.size());
+            if (fd >= 0) {
+                struct stat st;
+                if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                    g_gguf_file_size_bytes = static_cast<long long>(st.st_size);
+                    g_gguf_file_size_mb = g_gguf_file_size_bytes / (1024LL * 1024LL);
+                }
+                bytesRead = pread(fd, headerBuf, sizeof(headerBuf), 0);
             }
         }
+
+        // 2. Fallback to standard stat + std::ifstream if not /proc/self/fd/<N> or if pread failed
+        if (bytesRead < 0) {
+            struct stat st;
+            if (stat(pathOrFd.c_str(), &st) == 0 && st.st_size > 0) {
+                g_gguf_file_size_bytes = static_cast<long long>(st.st_size);
+                g_gguf_file_size_mb = g_gguf_file_size_bytes / (1024LL * 1024LL);
+            }
+
+            std::ifstream file(pathOrFd, std::ios::binary);
+            if (!file.is_open()) {
+                g_last_load_rc = -2;
+                g_last_load_diagnosis =
+                    "ERROR [-2] Cannot open model descriptor '" + pathOrFd + "' (Permission denied or file moved/deleted). "
+                    "SOLUTION: Tap 'Select .GGUF File from Phone Storage' to re-select the file and refresh Android SAF read permissions.";
+                LOGE("%s", g_last_load_diagnosis.c_str());
+                return g_last_load_rc;
+            }
+
+            if (g_gguf_file_size_bytes <= 0) {
+                file.seekg(0, std::ios::end);
+                std::streampos endPos = file.tellg();
+                if (endPos > 0) {
+                    g_gguf_file_size_bytes = static_cast<long long>(endPos);
+                    g_gguf_file_size_mb = g_gguf_file_size_bytes / (1024LL * 1024LL);
+                }
+                file.seekg(0, std::ios::beg);
+            }
+
+            file.read(reinterpret_cast<char*>(headerBuf), sizeof(headerBuf));
+            bytesRead = static_cast<ssize_t>(file.gcount());
+        }
+
+        if (bytesRead < 24 || (g_gguf_file_size_bytes > 0 && g_gguf_file_size_bytes < 64)) {
+            g_last_load_rc = -3;
+            g_last_load_diagnosis =
+                "ERROR [-3] Model file is empty or truncated (read " + std::to_string(bytesRead) +
+                " header bytes, total size " + std::to_string(g_gguf_file_size_bytes) + " bytes). "
+                "SOLUTION: The download in your phone's Downloads folder appears incomplete. Delete the partial file and re-download the complete .gguf model.";
+            LOGE("%s", g_last_load_diagnosis.c_str());
+            return g_last_load_rc;
+        }
+
+        // Verify 'G','G','U','F' magic bytes (0x47, 0x47, 0x55, 0x46)
+        if (headerBuf[0] != 0x47 || headerBuf[1] != 0x47 || headerBuf[2] != 0x55 || headerBuf[3] != 0x46) {
+            std::string detected = detectWrongFileFormat(headerBuf);
+            g_last_load_rc = -4;
+            g_last_load_diagnosis =
+                "ERROR [-4] Invalid GGUF binary magic header: expected 'GGUF' (0x47475546), found " +
+                formatMagicHex(headerBuf) + " [" + detected + "]. "
+                "SOLUTION: Ensure you downloaded a quantized .gguf weight file (e.g., model-Q4_K_M.gguf) rather than a Safetensors, PyTorch .bin/.pt, ZIP, or HTML redirect file.";
+            LOGE("%s", g_last_load_diagnosis.c_str());
+            return g_last_load_rc;
+        }
+
+        uint32_t version = 0;
+        uint64_t tensors = 0;
+        uint64_t kvCount = 0;
+        std::memcpy(&version, headerBuf + 4, sizeof(uint32_t));
+        std::memcpy(&tensors, headerBuf + 8, sizeof(uint64_t));
+        std::memcpy(&kvCount, headerBuf + 16, sizeof(uint64_t));
+
+        if (version < 1 || version > 3) {
+            g_last_load_rc = -5;
+            g_last_load_diagnosis =
+                "ERROR [-5] Unsupported GGUF specification version v" + std::to_string(version) +
+                " (PocketGGUF supports GGUF v1, v2, and v3). "
+                "SOLUTION: Re-download or quantize the model with standard llama.cpp GGUF v2/v3 format.";
+            LOGE("%s", g_last_load_diagnosis.c_str());
+            return g_last_load_rc;
+        }
+
+        if (tensors == 0 || tensors > 100000) {
+            g_last_load_rc = -6;
+            g_last_load_diagnosis =
+                "ERROR [-6] Corrupted GGUF tensor directory (header reports " + std::to_string(tensors) +
+                " tensors). "
+                "SOLUTION: The .gguf file header is corrupted. Re-download a clean copy of the .gguf file.";
+            LOGE("%s", g_last_load_diagnosis.c_str());
+            return g_last_load_rc;
+        }
+
+        g_gguf_header_verified = true;
+        g_gguf_version = version;
+        g_gguf_tensor_count = tensors;
+        g_gguf_kv_count = kvCount;
+        g_last_load_rc = 0;
+
+        std::ostringstream okMsg;
+        okMsg << "OK [0] Verified GGUF v" << g_gguf_version
+              << " (0x47475546) · " << g_gguf_tensor_count << " tensors · "
+              << g_gguf_kv_count << " KV metadata keys";
+        if (g_gguf_file_size_mb > 0) {
+            okMsg << " · " << g_gguf_file_size_mb << " MB";
+        }
+        okMsg << " · mmap=" << (g_use_mmap ? "ON" : "OFF")
+              << " · KV=" << g_kv_quant
+              << " · n_ctx=" << g_context_length;
+        g_last_load_diagnosis = okMsg.str();
+        return 0;
     }
 
     /**
@@ -196,18 +327,22 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeLoadModel(
     if (kvChars) env->ReleaseStringUTFChars(kvCacheQuant, kvChars);
 
     applyBigLittleCoreAffinity(g_pin_big_little);
-    inspectBinaryGgufHeader(g_loaded_model_path);
+    int rc = inspectAndVerifyBinaryGgufHeader(g_loaded_model_path);
 
-    LOGI("Loaded GGUF: path=%s, verified=%d, tensors=%llu, kv_meta=%llu, size_mb=%lld, n_ctx=%d, kv=%s",
+    LOGI("nativeLoadModel: path=%s, rc=%d, diagnosis=%s",
          g_loaded_model_path.c_str(),
-         g_gguf_header_verified ? 1 : 0,
-         static_cast<unsigned long long>(g_gguf_tensor_count),
-         static_cast<unsigned long long>(g_gguf_kv_count),
-         g_gguf_file_size_mb,
-         g_context_length,
-         g_kv_quant.c_str());
+         rc,
+         g_last_load_diagnosis.c_str());
 
-    return 0;
+    return static_cast<jint>(rc);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_pocketgguf_engine_LlamaBridge_nativeGetLastLoadDiagnosis(
+        JNIEnv* env,
+        jobject /* this */) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    return env->NewStringUTF(g_last_load_diagnosis.c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -232,15 +367,28 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeCompleteChat(
 
     applyBigLittleCoreAffinity(g_pin_big_little);
 
-    int reusedTokens = (reusePrefixCache == JNI_TRUE)
-        ? computePrefixCacheReuse(promptStr, static_cast<int>(pinnedSystemTokens))
-        : 0;
-
     std::string userMsg = extractJsonStringField(promptStr, "content", true);
     std::string requestedModelId = extractJsonStringField(promptStr, "model", false);
     if (requestedModelId.empty()) {
         requestedModelId = g_loaded_model_path;
     }
+
+    // If the model failed binary GGUF verification or descriptor loading, return an explicit error & proposed solution
+    if (g_last_load_rc != 0) {
+        std::ostringstream errOut;
+        errOut << "{"
+               << "\"error\":{"
+               << "\"message\":\"Model Load Verification Failed: " << escapeJsonString(g_last_load_diagnosis) << "\","
+               << "\"type\":\"model_load_verification_failed\","
+               << "\"code\":\"native_load_rc_" << g_last_load_rc << "\""
+               << "}"
+               << "}";
+        return env->NewStringUTF(errOut.str().c_str());
+    }
+
+    int reusedTokens = (reusePrefixCache == JNI_TRUE)
+        ? computePrefixCacheReuse(promptStr, static_cast<int>(pinnedSystemTokens))
+        : 0;
 
     LOGI("nativeCompleteChat: model=%s, userMsgLen=%zu, n_ctx=%d, threads=%d, gbnf=%d",
          requestedModelId.c_str(),
@@ -266,9 +414,8 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeCompleteChat(
         textPayload << "[" << requestedModelId << " · Native JNI Engine]\n\n"
                     << "Received prompt: \"" << (userMsg.empty() ? "Hello" : userMsg) << "\"\n\n"
                     << "• Mounted Descriptor: " << (g_loaded_model_path.empty() ? "in-process" : g_loaded_model_path) << "\n"
-                    << "• Binary GGUF Header: "
-                    << (g_gguf_header_verified ? "Verified (GGUF v" + std::to_string(g_gguf_version) + ")" : "Mounted via Android SAF")
-                    << " · " << g_gguf_tensor_count << " tensors · " << g_gguf_kv_count << " KV metadata keys";
+                    << "• Binary GGUF Header: Verified (GGUF v" << g_gguf_version << ") · "
+                    << g_gguf_tensor_count << " tensors · " << g_gguf_kv_count << " KV metadata keys";
         if (g_gguf_file_size_mb > 0) {
             textPayload << " · " << g_gguf_file_size_mb << " MB";
         }
@@ -307,6 +454,8 @@ Java_com_pocketgguf_engine_LlamaBridge_nativeUnloadModel(
     g_loaded_model_path.clear();
     g_last_pinned_prompt.clear();
     g_gguf_header_verified = false;
+    g_last_load_rc = -1;
+    g_last_load_diagnosis = "Model unloaded.";
     LOGI("Unloaded GGUF model and freed Q4_0 KV cache tensors.");
 }
 

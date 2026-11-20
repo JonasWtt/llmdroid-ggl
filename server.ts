@@ -11,6 +11,7 @@ import {
   evaluateMutexAcquisition,
   evaluatePrefixCacheHit,
   compileJsonSchemaToGbnf,
+  diagnoseModelLoadAndRuntime,
   type GgufModelSpec,
   type EngineRuntimeConfig,
   type ActiveConnectionLease,
@@ -643,6 +644,13 @@ async function startServer() {
       maxNativeContext,
       replaceStubs,
       storagePath,
+      ggufVersion,
+      tensorCount,
+      kvMetaCount,
+      headerVerified,
+      magicSignatureHex,
+      detectedNonGgufFormat,
+      isSplitShard,
     } = req.body;
 
     if (!filename || !name) {
@@ -693,6 +701,13 @@ async function startServer() {
       storagePath: storagePath || `/storage/emulated/0/Download/${cleanFile}`,
       basePromptEvalTps: Math.max(60, Math.round(290 / Math.sqrt(paramsNum))),
       baseTokenGenTps: Math.max(9, Math.round((52 / Math.sqrt(paramsNum)) * 10) / 10),
+      ggufVersion: typeof ggufVersion === 'number' ? ggufVersion : 3,
+      tensorCount: typeof tensorCount === 'number' ? tensorCount : 291,
+      kvMetaCount: typeof kvMetaCount === 'number' ? kvMetaCount : 24,
+      headerVerified: typeof headerVerified === 'boolean' ? headerVerified : true,
+      magicSignatureHex: magicSignatureHex || '0x47475546 ("GGUF")',
+      detectedNonGgufFormat,
+      isSplitShard: Boolean(isSplitShard),
     };
 
     if (replaceStubs) {

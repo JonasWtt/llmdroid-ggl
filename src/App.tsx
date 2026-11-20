@@ -11,12 +11,15 @@ import {
   DEFAULT_ENGINE_CONFIG,
   calculateMemoryBreakdown,
   estimateThroughput,
+  inspectRawGgufHeaderBytes,
+  diagnoseModelLoadAndRuntime,
   type GgufModelSpec,
   type EngineRuntimeConfig,
   type ActiveConnectionLease,
   type ApiAuditEntry,
   type TelemetrySample,
   type QuantizationType,
+  type AutoFixActionType,
 } from './utils/ggufEngineLogic';
 import { ServerDaemonPanel } from './components/ServerDaemonPanel';
 import { ModelVaultPanel } from './components/ModelVaultPanel';
@@ -26,6 +29,10 @@ import {
   LocalModelChatPanel,
   type ChatTurnMessage,
 } from './components/LocalModelChatPanel';
+import {
+  ModelLoadDiagnosticBanner,
+  type FaultSimulationPreset,
+} from './components/ModelLoadDiagnosticBanner';
 
 type ActiveSection = 'daemon' | 'models' | 'context' | 'bridge' | 'chat';
 
@@ -60,10 +67,71 @@ export default function App() {
 
   const [chatMessages, setChatMessages] = useState<ChatTurnMessage[]>([]);
   const [chatSending, setChatSending] = useState<boolean>(false);
+  const [activeFaultPreset, setActiveFaultPreset] =
+    useState<FaultSimulationPreset>('NONE');
 
-  const activeModel =
-    models.find((m) => m.id === runtimeConfig.activeModelId) || models[0];
-  const memory = calculateMemoryBreakdown(activeModel, runtimeConfig);
+  const rawActiveModel =
+    models.find((m) => m.id === runtimeConfig.activeModelId);
+  const activeModel = rawActiveModel || models[0];
+
+  const effectiveModelForDiag: GgufModelSpec | null = (() => {
+    if (activeFaultPreset === 'INVALID_HTML_HEADER' && activeModel) {
+      return {
+        ...activeModel,
+        filename: 'DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED.gguf',
+        headerVerified: false,
+        magicSignatureHex: '0x3C 0x21 0x44 0x4F ("<!DO")',
+        detectedNonGgufFormat:
+          'HTML Web Page (likely a HuggingFace / browser login or redirect page saved as .gguf)',
+      };
+    }
+    if (activeFaultPreset === 'OOM_RAM_EXCEEDED' && activeModel) {
+      return {
+        ...activeModel,
+        name: 'DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-Q4_K_M',
+        filename: 'DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-Q4_K_M.gguf',
+        parametersBillions: 9.0,
+        fileSizeMb: 5832,
+        headerVerified: true,
+        ggufVersion: 3,
+        tensorCount: 339,
+        kvMetaCount: 28,
+      };
+    }
+    return rawActiveModel || null;
+  })();
+
+  const effectiveConfigForDiag: EngineRuntimeConfig =
+    activeFaultPreset === 'OOM_RAM_EXCEEDED'
+      ? {
+          ...runtimeConfig,
+          contextLength: 32768,
+          kvCacheQuant: 'FP16',
+          mmapEnabled: false,
+        }
+      : runtimeConfig;
+
+  const memory = calculateMemoryBreakdown(
+    effectiveModelForDiag || activeModel,
+    effectiveConfigForDiag
+  );
+
+  const diagnosticReport = diagnoseModelLoadAndRuntime({
+    model: effectiveModelForDiag,
+    config: effectiveConfigForDiag,
+    memory,
+    serverRunning,
+    activeLease,
+    safDescriptorError:
+      activeFaultPreset === 'SAF_PERMISSION_EXPIRED'
+        ? 'SecurityException: Permission Denial: opening provider com.android.providers.downloads.documents from ProcessRecord requires that you obtain access using ACTION_OPEN_DOCUMENT'
+        : null,
+    portBindError:
+      activeFaultPreset === 'PORT_CONFLICT'
+        ? `java.net.BindException: Address already in use (127.0.0.1:${runtimeConfig.port})`
+        : null,
+  });
+
   const throughput = estimateThroughput(
     activeModel,
     runtimeConfig,
@@ -147,8 +215,16 @@ export default function App() {
     maxNativeContext: number;
     replaceStubs?: boolean;
     storagePath?: string;
+    ggufVersion?: number;
+    tensorCount?: number;
+    kvMetaCount?: number;
+    headerVerified?: boolean;
+    magicSignatureHex?: string;
+    detectedNonGgufFormat?: string;
+    isSplitShard?: boolean;
   }) => {
     try {
+      setActiveFaultPreset('NONE');
       const res = await fetch('/api/engine/models/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -168,18 +244,35 @@ export default function App() {
 
   const handleSelectLocalGgufFile = async (file: File, replaceStubs: boolean) => {
     let ggufHeaderTag = '';
+    let headerInspection = {
+      headerVerified: false,
+      ggufVersion: 0,
+      tensorCount: 0,
+      kvMetaCount: 0,
+      magicSignatureHex: 'UNREAD',
+      detectedNonGgufFormat: undefined as string | undefined,
+      isSplitShard: false,
+    };
+
     try {
       const sliceBuffer = await file.slice(0, 24).arrayBuffer();
-      const view = new DataView(sliceBuffer);
-      if (
-        sliceBuffer.byteLength >= 8 &&
-        view.getUint8(0) === 0x47 &&
-        view.getUint8(1) === 0x47 &&
-        view.getUint8(2) === 0x55 &&
-        view.getUint8(3) === 0x46
-      ) {
-        const version = view.getUint32(4, true);
-        ggufHeaderTag = ` (GGUF v${version})`;
+      const rawBytes = new Uint8Array(sliceBuffer);
+      const inspected = inspectRawGgufHeaderBytes(
+        rawBytes,
+        file.name,
+        file.size
+      );
+      headerInspection = {
+        headerVerified: inspected.headerVerified,
+        ggufVersion: inspected.ggufVersion,
+        tensorCount: inspected.tensorCount,
+        kvMetaCount: inspected.kvMetaCount,
+        magicSignatureHex: inspected.magicSignatureHex,
+        detectedNonGgufFormat: inspected.detectedNonGgufFormat,
+        isSplitShard: inspected.isSplitShard,
+      };
+      if (inspected.headerVerified) {
+        ggufHeaderTag = ` (GGUF v${inspected.ggufVersion})`;
       }
     } catch {
       // ignore header slice read error
@@ -205,9 +298,11 @@ export default function App() {
           ? 'phi3'
           : 'llama';
 
-    const sizeMb = Math.max(1, Math.round(file.size / (1024 * 1024)));
+    const sizeMb = Math.max(0, Math.round(file.size / (1024 * 1024)));
     const paramMatch = file.name.match(/(\d+(?:\.\d+)?)\s*[bB]/);
-    const inferredParams = paramMatch ? parseFloat(paramMatch[1]) : Math.max(0.5, +(sizeMb / 650).toFixed(1));
+    const inferredParams = paramMatch
+      ? parseFloat(paramMatch[1])
+      : Math.max(0.5, +(Math.max(1, sizeMb) / 650).toFixed(1));
 
     const cleanDisplayName =
       file.name.replace(/\.gguf$/i, '').replace(/[-_]+/g, ' ') + ggufHeaderTag;
@@ -222,7 +317,40 @@ export default function App() {
       maxNativeContext: 32768,
       replaceStubs,
       storagePath: `/storage/emulated/0/Download/${file.name}`,
+      ggufVersion: headerInspection.ggufVersion,
+      tensorCount: headerInspection.tensorCount,
+      kvMetaCount: headerInspection.kvMetaCount,
+      headerVerified: headerInspection.headerVerified,
+      magicSignatureHex: headerInspection.magicSignatureHex,
+      detectedNonGgufFormat: headerInspection.detectedNonGgufFormat,
+      isSplitShard: headerInspection.isSplitShard,
     });
+  };
+
+  const handleApplyAutoFix = async (action: AutoFixActionType) => {
+    setActiveFaultPreset('NONE');
+    if (action === 'APPLY_LOW_RAM_SAFE_PROFILE') {
+      await handleUpdateConfig({
+        contextLength: 2048,
+        kvCacheQuant: 'Q4_0',
+        mmapEnabled: true,
+        batchSize: 256,
+      });
+    } else if (action === 'PICK_GGUF_FILE' || action === 'SCAN_GGUF_FOLDER') {
+      setActiveSection('models');
+    } else if (action === 'SWITCH_FALLBACK_PORT') {
+      const nextPort = runtimeConfig.port === 8080 ? 8081 : 8080;
+      await handleUpdateConfig({ port: nextPort });
+      if (!serverRunning) {
+        await handleToggleServer();
+      }
+    } else if (action === 'START_LOCAL_SERVER') {
+      if (!serverRunning) {
+        await handleToggleServer();
+      }
+    } else if (action === 'FORCE_RELEASE_MUTEX') {
+      await handleReleaseMutex();
+    }
   };
 
   const handleRemoveModel = async (modelId: string) => {
@@ -557,6 +685,13 @@ export default function App() {
 
       {/* Main Content Workspace */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 pt-6">
+        <ModelLoadDiagnosticBanner
+          report={diagnosticReport}
+          activeFaultPreset={activeFaultPreset}
+          onApplyAutoFix={handleApplyAutoFix}
+          onSelectFaultPreset={setActiveFaultPreset}
+        />
+
         {activeSection === 'daemon' && (
           <ServerDaemonPanel
             serverRunning={serverRunning}
