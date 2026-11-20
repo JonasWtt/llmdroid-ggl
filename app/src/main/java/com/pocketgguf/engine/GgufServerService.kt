@@ -71,6 +71,7 @@ class GgufServerService : Service() {
     }
 
     private var activeModelPfd: android.os.ParcelFileDescriptor? = null
+    private var lastLoadedUriString: String = ""
 
     private fun resolveNativePathOrFd(uriString: String): String {
         if (uriString.startsWith("content://")) {
@@ -87,6 +88,24 @@ class GgufServerService : Service() {
         return uriString
     }
 
+    private fun ensureActiveModelLoadedInJni(state: EngineTelemetryState) {
+        if (!state.hasValidModelMounted) return
+        if (lastLoadedUriString != state.activeModel.uriString) {
+            val nativePath = resolveNativePathOrFd(state.activeModel.uriString)
+            LlamaBridge.nativeLoadModel(
+                modelPathOrFd = nativePath,
+                contextLength = state.contextLength,
+                batchSize = state.batchSize,
+                threads = state.effectiveActiveThreads,
+                kvCacheQuant = state.kvCacheQuant,
+                useMmap = state.mmapEnabled,
+                pinBigLittleCores = state.bigLittleCorePinning,
+                pinnedPrefixTokens = state.pinnedSystemTokens
+            )
+            lastLoadedUriString = state.activeModel.uriString
+        }
+    }
+
     private fun startHttpServerLoop(bindHost: String, port: Int) {
         acceptJob?.cancel()
         runCatching { serverSocket?.close() }
@@ -100,17 +119,7 @@ class GgufServerService : Service() {
                     return@launch
                 }
 
-                val nativePath = resolveNativePathOrFd(state.activeModel.uriString)
-                LlamaBridge.nativeLoadModel(
-                    modelPathOrFd = nativePath,
-                    contextLength = state.contextLength,
-                    batchSize = state.batchSize,
-                    threads = state.effectiveActiveThreads,
-                    kvCacheQuant = state.kvCacheQuant,
-                    useMmap = state.mmapEnabled,
-                    pinBigLittleCores = state.bigLittleCorePinning,
-                    pinnedPrefixTokens = state.pinnedSystemTokens
-                )
+                ensureActiveModelLoadedInJni(state)
 
                 val inetAddress = InetAddress.getByName(bindHost)
                 serverSocket = ServerSocket(port, 8, inetAddress)
@@ -207,7 +216,10 @@ class GgufServerService : Service() {
 
                     val leaseId = "lease-" + UUID.randomUUID().toString().take(6)
                     val snapshot = EngineStateRepository.state.value
-                    val enforceJson = snapshot.gbnfJsonGrammarEnabled || requestBody.contains("json_object")
+                    ensureActiveModelLoadedInJni(snapshot)
+                    val enforceJson =
+                        snapshot.gbnfJsonGrammarEnabled &&
+                        (requestBody.contains("json_object") || requestBody.contains("json_schema") || requestBody.contains("force_gbnf"))
                     val reusedPrefix = if (snapshot.prefixCachePinningEnabled) snapshot.pinnedSystemTokens else 0
 
                     try {

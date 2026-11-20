@@ -374,11 +374,43 @@ async function startServer() {
       return;
     }
 
-    // Standard synchronous completion
-    const simulatedWait = Math.min(1500, Math.max(120, holdDurationMs));
+    // Standard synchronous completion (used by Local Chat tab & Self API Test)
+    const simulatedWait = Math.min(900, Math.max(110, holdDurationMs));
     await new Promise((resolve) => setTimeout(resolve, simulatedWait));
 
-    const completionTokens = 64;
+    const lastUserMessageObj = [...messages]
+      .reverse()
+      .find((m: { role?: string; content?: string }) => m.role === 'user');
+    const lastUserText = (lastUserMessageObj?.content || 'Hello').trim();
+    const reusedPrefixTokens = runtimeConfig.prefixCachePinningEnabled
+      ? runtimeConfig.pinnedSystemTokens
+      : 0;
+
+    let assistantReply: string;
+    if (req.body?.response_format?.type === 'json_object') {
+      assistantReply = JSON.stringify(
+        {
+          tool_call: 'local_gguf_response',
+          model: activeModel.id,
+          query: lastUserText,
+          kv_cache_quant: runtimeConfig.kvCacheQuant,
+          prefix_tokens_reused: reusedPrefixTokens,
+          tokens_per_sec: tput.tokenGenTps,
+          status: 'ok',
+        },
+        null,
+        2
+      );
+    } else {
+      assistantReply =
+        `[${activeModel.name} (${activeModel.quantization}) · Local OpenAI Server :${runtimeConfig.port}/v1]\n\n` +
+        `Replying to: "${lastUserText}"\n\n` +
+        `• Active GGUF Artifact: ${activeModel.filename} (${activeModel.fileSizeMb.toLocaleString()} MB)\n` +
+        `• Single-Slot Runtime: n_ctx=${runtimeConfig.contextLength.toLocaleString()} · KV Cache=${runtimeConfig.kvCacheQuant} · Prefix Reused (n_keep)=${reusedPrefixTokens} tok\n` +
+        `• Throughput: ${tput.tokenGenTps} tok/s (Prompt eval: ${tput.promptEvalTps} tok/s · Core Affinity 0xFC)`;
+    }
+
+    const completionTokens = Math.max(36, Math.round(assistantReply.length / 3.8));
     activeLease = null;
     totalRequestsServed += 1;
     totalTokensGenerated += completionTokens;
@@ -409,7 +441,7 @@ async function startServer() {
           index: 0,
           message: {
             role: 'assistant',
-            content: `[GGUF Engine Response from ${activeModel.filename} @ ctx=${runtimeConfig.contextLength}, kv=${runtimeConfig.kvCacheQuant}, speed=${tput.tokenGenTps} tok/s]`,
+            content: assistantReply,
           },
           finish_reason: 'stop',
         },
@@ -418,6 +450,8 @@ async function startServer() {
         prompt_tokens: estimatedPromptTokens,
         completion_tokens: completionTokens,
         total_tokens: estimatedPromptTokens + completionTokens,
+        prefix_cache_reused_tokens: reusedPrefixTokens,
+        tokens_per_sec: tput.tokenGenTps,
       },
     });
   });

@@ -4,7 +4,7 @@ import {
   HardDrive,
   Sliders,
   Lock,
-  Cpu,
+  MessageSquare,
 } from 'lucide-react';
 import {
   INITIAL_GGUF_MODELS,
@@ -22,9 +22,12 @@ import { ServerDaemonPanel } from './components/ServerDaemonPanel';
 import { ModelVaultPanel } from './components/ModelVaultPanel';
 import { ContextRuntimePanel } from './components/ContextRuntimePanel';
 import { ApiBridgeMutexPanel } from './components/ApiBridgeMutexPanel';
-import { ArchitectureIdeasPanel } from './components/ArchitectureIdeasPanel';
+import {
+  LocalModelChatPanel,
+  type ChatTurnMessage,
+} from './components/LocalModelChatPanel';
 
-type ActiveSection = 'daemon' | 'models' | 'context' | 'bridge' | 'blueprint';
+type ActiveSection = 'daemon' | 'models' | 'context' | 'bridge' | 'chat';
 
 export default function App() {
   const [activeSection, setActiveSection] = useState<ActiveSection>('daemon');
@@ -54,6 +57,9 @@ export default function App() {
     answer: string;
     latencyMs: number;
   } | null>(null);
+
+  const [chatMessages, setChatMessages] = useState<ChatTurnMessage[]>([]);
+  const [chatSending, setChatSending] = useState<boolean>(false);
 
   const activeModel =
     models.find((m) => m.id === runtimeConfig.activeModelId) || models[0];
@@ -295,6 +301,95 @@ export default function App() {
     }
   };
 
+  const handleSendLocalChatMessage = async (promptText: string, forceJsonMode?: boolean) => {
+    const userMsg: ChatTurnMessage = {
+      id: `usr-${Date.now()}`,
+      role: 'user',
+      content: promptText,
+      modelId: activeModel.id,
+    };
+
+    const nextHistory = [...chatMessages, userMsg];
+    setChatMessages(nextHistory);
+    setChatSending(true);
+    const t0 = Date.now();
+
+    try {
+      const apiMessages = nextHistory
+        .filter((m) => !m.isError)
+        .slice(-12)
+        .map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+
+      const res = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${runtimeConfig.bearerToken}`,
+          'X-Client-Agent': 'PocketGGUF-Local-Chat-Tab',
+          'X-Client-IP': '127.0.0.1',
+        },
+        body: JSON.stringify({
+          model: activeModel.id,
+          messages: apiMessages,
+          async_hold: false,
+          hold_mutex_ms: 140,
+          response_format: forceJsonMode ? { type: 'json_object' } : undefined,
+        }),
+      });
+
+      const latencyMs = Math.max(1, Date.now() - t0);
+      const data = await res.json();
+
+      if (res.ok) {
+        const replyContent =
+          data?.choices?.[0]?.message?.content || JSON.stringify(data, null, 2);
+        const assistantMsg: ChatTurnMessage = {
+          id: `ast-${Date.now()}`,
+          role: 'assistant',
+          content: replyContent,
+          modelId: activeModel.id,
+          latencyMs,
+          reusedPrefixTokens: data?.usage?.prefix_cache_reused_tokens ?? runtimeConfig.pinnedSystemTokens,
+          tokensPerSec: data?.usage?.tokens_per_sec ?? throughput.tokenGenTps,
+          isError: false,
+        };
+        setChatMessages((prev) => [...prev, assistantMsg]);
+      } else {
+        const errText =
+          data?.error?.message || `HTTP ${res.status}: Failed to reach local server.`;
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: 'assistant',
+            content: errText,
+            modelId: activeModel.id,
+            latencyMs,
+            isError: true,
+          },
+        ]);
+      }
+      await fetchEngineState();
+    } catch (err) {
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          role: 'assistant',
+          content: String(err),
+          modelId: activeModel.id,
+          latencyMs: Math.max(1, Date.now() - t0),
+          isError: true,
+        },
+      ]);
+    } finally {
+      setChatSending(false);
+    }
+  };
+
   const handleFireApiProbe = async (options: {
     endpoint: '/v1/chat/completions' | '/v1/models' | '/v1/embeddings';
     clientLabel: string;
@@ -420,18 +515,18 @@ export default function App() {
             API Bridge
           </a>
           <a
-            href="#blueprint"
+            href="#chat"
             onClick={(e) => {
               e.preventDefault();
-              setActiveSection('blueprint');
+              setActiveSection('chat');
             }}
             className={`transition-colors whitespace-nowrap shrink-0 py-1 ${
-              activeSection === 'blueprint'
+              activeSection === 'chat'
                 ? 'text-slate-900 font-semibold underline underline-offset-8 decoration-2'
                 : 'hover:text-slate-900'
             }`}
           >
-            Architecture
+            Chat
           </a>
         </nav>
 
@@ -526,9 +621,16 @@ export default function App() {
           />
         )}
 
-        {activeSection === 'blueprint' && (
-          <ArchitectureIdeasPanel
+        {activeSection === 'chat' && (
+          <LocalModelChatPanel
+            serverRunning={serverRunning}
+            activeModel={activeModel}
             runtimeConfig={runtimeConfig}
+            messages={chatMessages}
+            isSending={chatSending}
+            onSendMessage={handleSendLocalChatMessage}
+            onClearMessages={() => setChatMessages([])}
+            onToggleServer={handleToggleServer}
             onUpdateConfig={handleUpdateConfig}
           />
         )}
@@ -585,13 +687,13 @@ export default function App() {
 
         <button
           type="button"
-          onClick={() => setActiveSection('blueprint')}
+          onClick={() => setActiveSection('chat')}
           className={`min-h-[44px] flex flex-col items-center justify-center cursor-pointer ${
-            activeSection === 'blueprint' ? 'text-slate-900 font-semibold' : 'text-slate-500'
+            activeSection === 'chat' ? 'text-slate-900 font-semibold' : 'text-slate-500'
           }`}
         >
-          <Cpu className="w-4 h-4" />
-          <span className="text-[10px] mt-0.5">Ideas</span>
+          <MessageSquare className="w-4 h-4" />
+          <span className="text-[10px] mt-0.5">Chat</span>
         </button>
       </nav>
     </div>

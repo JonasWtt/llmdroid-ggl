@@ -40,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -66,6 +67,8 @@ import androidx.core.view.WindowCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -462,8 +465,18 @@ enum class AppTab(val title: String) {
     MODELS("Models"),
     CONTEXT("Context"),
     BRIDGE("API Bridge"),
-    BLUEPRINT("Ideas")
+    CHAT("Chat")
 }
+
+data class LocalChatMessage(
+    val id: String,
+    val role: String, // "user" | "assistant" | "system"
+    val content: String,
+    val modelId: String,
+    val latencyMs: Long = 0L,
+    val reusedPrefixTokens: Int = 0,
+    val isError: Boolean = false
+)
 
 @Composable
 fun PocketGgufAppShell(
@@ -478,6 +491,9 @@ fun PocketGgufAppShell(
     var selfTestLoading by remember { mutableStateOf(false) }
     var selfTestResult by remember { mutableStateOf<String?>(null) }
     var lastCopiedModelId by remember { mutableStateOf<String?>(null) }
+    var chatMessages by remember { mutableStateOf<List<LocalChatMessage>>(emptyList()) }
+    var chatInput by remember { mutableStateOf("") }
+    var chatSending by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
 
     val runSelfApiTest: () -> Unit = {
@@ -487,6 +503,28 @@ fun PocketGgufAppShell(
             val responseText = executeLocalSelfApiTest(state)
             selfTestResult = responseText
             selfTestLoading = false
+        }
+    }
+
+    val sendChatPrompt: (String) -> Unit = { rawPrompt ->
+        val prompt = rawPrompt.trim()
+        if (prompt.isNotEmpty() && !chatSending) {
+            val userMsg = LocalChatMessage(
+                id = "usr-${System.currentTimeMillis()}",
+                role = "user",
+                content = prompt,
+                modelId = state.activeModel.id
+            )
+            val updatedHistory = chatMessages + userMsg
+            chatMessages = updatedHistory
+            chatInput = ""
+            chatSending = true
+
+            coroutineScope.launch {
+                val reply = executeLocalChatTurn(state, updatedHistory)
+                chatMessages = chatMessages + reply
+                chatSending = false
+            }
         }
     }
 
@@ -578,7 +616,7 @@ fun PocketGgufAppShell(
                                     AppTab.MODELS -> "▤"
                                     AppTab.CONTEXT -> "⚙"
                                     AppTab.BRIDGE -> "⇄"
-                                    AppTab.BLUEPRINT -> "✦"
+                                    AppTab.CHAT -> "💬"
                                 },
                                 fontSize = 16.sp
                             )
@@ -626,7 +664,18 @@ fun PocketGgufAppShell(
                     selfTestResult = selfTestResult,
                     onRunSelfApiTest = runSelfApiTest
                 )
-                AppTab.BLUEPRINT -> ArchitectureScreen(state = state)
+                AppTab.CHAT -> LocalModelChatScreen(
+                    state = state,
+                    messages = chatMessages,
+                    inputText = chatInput,
+                    isSending = chatSending,
+                    onInputChange = { chatInput = it },
+                    onSendMessage = { sendChatPrompt(chatInput) },
+                    onQuickPrompt = { sendChatPrompt(it) },
+                    onClearChat = { chatMessages = emptyList() },
+                    onToggleServer = onToggleServer,
+                    onPickSafGguf = onPickSafGguf
+                )
             }
         }
     }
@@ -1501,39 +1550,411 @@ fun ApiBridgeScreen(
     }
 }
 
+/**
+ * Sends a multi-turn OpenAI /v1/chat/completions request directly to the local server
+ * hosted by GgufServerService on http://127.0.0.1:<port>/v1/chat/completions
+ */
+private suspend fun executeLocalChatTurn(
+    state: EngineTelemetryState,
+    history: List<LocalChatMessage>
+): LocalChatMessage = withContext(Dispatchers.IO) {
+    val t0 = System.currentTimeMillis()
+
+    if (!state.hasValidModelMounted) {
+        return@withContext LocalChatMessage(
+            id = "err-${System.currentTimeMillis()}",
+            role = "assistant",
+            content = "No .GGUF file is mounted yet. Tap 'Select .GGUF File' above to pick a model from your phone storage.",
+            modelId = "unmounted",
+            latencyMs = 1L,
+            isError = true
+        )
+    }
+
+    if (!state.serverRunning) {
+        return@withContext LocalChatMessage(
+            id = "err-${System.currentTimeMillis()}",
+            role = "assistant",
+            content = "Local OpenAI server is currently stopped. Tap 'Start Server' above to start serving ${state.activeModel.id} on http://127.0.0.1:${state.port}/v1.",
+            modelId = state.activeModel.id,
+            latencyMs = 1L,
+            isError = true
+        )
+    }
+
+    try {
+        val messagesArray = JSONArray()
+        for (msg in history.takeLast(12)) {
+            if (!msg.isError) {
+                val obj = JSONObject()
+                obj.put("role", msg.role)
+                obj.put("content", msg.content)
+                messagesArray.put(obj)
+            }
+        }
+
+        val rootPayload = JSONObject().apply {
+            put("model", state.activeModel.id)
+            put("messages", messagesArray)
+            put("temperature", 0.2)
+        }
+
+        val url = URL("http://127.0.0.1:${state.port}/v1/chat/completions")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 5000
+            readTimeout = 30000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", "Bearer ${state.bearerToken}")
+        }
+
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+            writer.write(rootPayload.toString())
+            writer.flush()
+        }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val body = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+        val elapsed = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+
+        val parsed = runCatching { JSONObject(body) }.getOrNull()
+        if (code in 200..299 && parsed != null) {
+            val content = parsed
+                .optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content")
+                ?.ifBlank { body }
+                ?: body
+            val reused = parsed.optJSONObject("usage")?.optInt("prefix_cache_reused_tokens", 0) ?: 0
+            LocalChatMessage(
+                id = "ast-${System.currentTimeMillis()}",
+                role = "assistant",
+                content = content,
+                modelId = state.activeModel.id,
+                latencyMs = elapsed,
+                reusedPrefixTokens = reused,
+                isError = false
+            )
+        } else {
+            val errMsg = parsed?.optJSONObject("error")?.optString("message") ?: "HTTP $code: $body"
+            LocalChatMessage(
+                id = "err-${System.currentTimeMillis()}",
+                role = "assistant",
+                content = errMsg,
+                modelId = state.activeModel.id,
+                latencyMs = elapsed,
+                isError = true
+            )
+        }
+    } catch (e: Exception) {
+        LocalChatMessage(
+            id = "err-${System.currentTimeMillis()}",
+            role = "assistant",
+            content = "Local Server Connection Error: ${e.message ?: "Failed to connect to 127.0.0.1:${state.port}"}",
+            modelId = state.activeModel.id,
+            latencyMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L),
+            isError = true
+        )
+    }
+}
+
 @Composable
-fun ArchitectureScreen(state: EngineTelemetryState) {
-    LazyColumn(
+fun LocalModelChatScreen(
+    state: EngineTelemetryState,
+    messages: List<LocalChatMessage>,
+    inputText: String,
+    isSending: Boolean,
+    onInputChange: (String) -> Unit,
+    onSendMessage: () -> Unit,
+    onQuickPrompt: (String) -> Unit,
+    onClearChat: () -> Unit,
+    onToggleServer: (Boolean) -> Unit,
+    onPickSafGguf: () -> Unit
+) {
+    val context = LocalContext.current
+
+    Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            .padding(16.dp)
     ) {
-        item {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = Color.White,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(12.dp))
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "Active Single-Slot Optimizations",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "1. KV Cache Quant: ${state.kvCacheQuant} (Saved ${state.kvSavedMb} MB)\n" +
-                            "2. Prefix Pinning (n_keep): ${state.pinnedSystemTokens} tok\n" +
-                            "3. GBNF JSON Schema Mask: ${if (state.gbnfJsonGrammarEnabled) "Enabled" else "Off"}\n" +
-                            "4. Core Affinity Mask: ${state.coreAffinityMaskHex}",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = Color(0xFF334155)
-                    )
+        // Connected Local Model Header Card
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = Color.White,
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(12.dp))
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (state.serverRunning && state.hasValidModelMounted) {
+                                "● CONNECTED TO LOCAL SERVER :${state.port}/v1"
+                            } else if (!state.hasValidModelMounted) {
+                                "○ NO .GGUF MODEL SELECTED"
+                            } else {
+                                "◐ LOCAL SERVER STOPPED (STANDBY)"
+                            },
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = when {
+                                !state.hasValidModelMounted -> Color(0xFFDC2626)
+                                state.serverRunning -> Color(0xFF15803D)
+                                else -> Color(0xFFB45309)
+                            }
+                        )
+                        Text(
+                            text = if (state.hasValidModelMounted) state.activeModel.name else "Select a .GGUF file to chat",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF0F172A),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (!state.hasValidModelMounted) {
+                            Button(
+                                onClick = onPickSafGguf,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("Select .GGUF", fontSize = 11.sp, maxLines = 1)
+                            }
+                        } else if (!state.serverRunning) {
+                            Button(
+                                onClick = { onToggleServer(true) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A)),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("Start Server", fontSize = 11.sp, maxLines = 1)
+                            }
+                        }
+                        if (messages.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = onClearChat,
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("Clear", fontSize = 11.sp, maxLines = 1)
+                            }
+                        }
+                    }
                 }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Chat Message List
+        LazyColumn(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            if (messages.isEmpty()) {
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color.White,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(12.dp))
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "Direct Local Model Chat (/v1/chat/completions)",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = Color(0xFF0F172A)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Messages sent here travel directly through your phone's local OpenAI HTTP server (http://127.0.0.1:${state.port}/v1/chat/completions) to the active GGUF model (${state.activeModel.id}).",
+                                fontSize = 12.sp,
+                                color = Color(0xFF475569)
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "Quick test prompts:",
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = Color(0xFF64748B)
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            listOf(
+                                "Hello! Confirm your loaded GGUF model header and active optimizations.",
+                                "Explain how Q4_0 KV cache quantization saves memory on Android.",
+                                "Write a compact Kotlin function to verify single-slot mutex locking."
+                            ).forEach { samplePrompt ->
+                                OutlinedButton(
+                                    onClick = { onQuickPrompt(samplePrompt) },
+                                    enabled = !isSending,
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = samplePrompt,
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF0F172A),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            items(messages) { msg ->
+                val isUser = msg.role == "user"
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = when {
+                        isUser -> Color(0xFF0F172A)
+                        msg.isError -> Color(0xFFFEF2F2)
+                        else -> Color.White
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(
+                            width = 1.dp,
+                            color = when {
+                                isUser -> Color(0xFF0F172A)
+                                msg.isError -> Color(0xFFFECACA)
+                                else -> Color(0xFFE2E8F0)
+                            },
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = if (isUser) {
+                                    "YOU"
+                                } else {
+                                    "MODEL: ${msg.modelId}"
+                                },
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = when {
+                                    isUser -> Color(0xFF94A3B8)
+                                    msg.isError -> Color(0xFFDC2626)
+                                    else -> Color(0xFF15803D)
+                                },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+
+                            if (!isUser) {
+                                Text(
+                                    text = "${msg.latencyMs} ms",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFF64748B)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = msg.content,
+                            fontSize = 13.sp,
+                            color = when {
+                                isUser -> Color.White
+                                msg.isError -> Color(0xFF991B1B)
+                                else -> Color(0xFF0F172A)
+                            }
+                        )
+
+                        if (!isUser && !msg.isError) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "KV ${state.kvCacheQuant} · n_keep ${msg.reusedPrefixTokens} tok",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFF64748B)
+                                )
+                                OutlinedButton(
+                                    onClick = {
+                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        clipboard.setPrimaryClip(ClipData.newPlainText("Model Reply", msg.content))
+                                        Toast.makeText(context, "Copied response to clipboard", Toast.LENGTH_SHORT).show()
+                                    },
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text("Copy Reply", fontSize = 10.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Bottom Message Input Row
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            OutlinedTextField(
+                value = inputText,
+                onValueChange = onInputChange,
+                placeholder = {
+                    Text(
+                        text = if (state.hasValidModelMounted) {
+                            "Message ${state.activeModel.id}..."
+                        } else {
+                            "Select a .GGUF model first..."
+                        },
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+
+            Button(
+                onClick = onSendMessage,
+                enabled = !isSending && inputText.trim().isNotEmpty(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text(
+                    text = if (isSending) "..." else "Send",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
             }
         }
     }
