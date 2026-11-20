@@ -47,6 +47,14 @@ export default function App() {
     payload: string;
   } | null>(null);
 
+  const [selfApiTestLoading, setSelfApiTestLoading] = useState<boolean>(false);
+  const [selfApiTestResult, setSelfApiTestResult] = useState<{
+    status: number;
+    modelId: string;
+    answer: string;
+    latencyMs: number;
+  } | null>(null);
+
   const activeModel =
     models.find((m) => m.id === runtimeConfig.activeModelId) || models[0];
   const memory = calculateMemoryBreakdown(activeModel, runtimeConfig);
@@ -83,7 +91,6 @@ export default function App() {
   }, [fetchEngineState]);
 
   const handleUpdateConfig = async (updates: Partial<EngineRuntimeConfig>) => {
-    // Optimistic local state update
     setRuntimeConfig((prev) => ({ ...prev, ...updates }));
     try {
       const res = await fetch('/api/engine/config', {
@@ -132,12 +139,92 @@ export default function App() {
     quantization: QuantizationType;
     fileSizeMb: number;
     maxNativeContext: number;
+    replaceStubs?: boolean;
+    storagePath?: string;
   }) => {
     try {
       const res = await fetch('/api/engine/models/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newModel),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.model?.id) {
+          navigator.clipboard?.writeText(data.model.id).catch(() => {});
+        }
+        await fetchEngineState();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSelectLocalGgufFile = async (file: File, replaceStubs: boolean) => {
+    let ggufHeaderTag = '';
+    try {
+      const sliceBuffer = await file.slice(0, 24).arrayBuffer();
+      const view = new DataView(sliceBuffer);
+      if (
+        sliceBuffer.byteLength >= 8 &&
+        view.getUint8(0) === 0x47 &&
+        view.getUint8(1) === 0x47 &&
+        view.getUint8(2) === 0x55 &&
+        view.getUint8(3) === 0x46
+      ) {
+        const version = view.getUint32(4, true);
+        ggufHeaderTag = ` (GGUF v${version})`;
+      }
+    } catch {
+      // ignore header slice read error
+    }
+
+    const upperName = file.name.toUpperCase();
+    const inferredQuant: QuantizationType = upperName.includes('IQ4_XS')
+      ? 'IQ4_XS'
+      : upperName.includes('Q5_K_M')
+        ? 'Q5_K_M'
+        : upperName.includes('Q8_0')
+          ? 'Q8_0'
+          : upperName.includes('F16') || upperName.includes('FP16')
+            ? 'FP16'
+            : 'Q4_K_M';
+
+    const lowerName = file.name.toLowerCase();
+    const inferredArch = lowerName.includes('qwen')
+      ? 'qwen2'
+      : lowerName.includes('gemma')
+        ? 'gemma2'
+        : lowerName.includes('phi')
+          ? 'phi3'
+          : 'llama';
+
+    const sizeMb = Math.max(1, Math.round(file.size / (1024 * 1024)));
+    const paramMatch = file.name.match(/(\d+(?:\.\d+)?)\s*[bB]/);
+    const inferredParams = paramMatch ? parseFloat(paramMatch[1]) : Math.max(0.5, +(sizeMb / 650).toFixed(1));
+
+    const cleanDisplayName =
+      file.name.replace(/\.gguf$/i, '').replace(/[-_]+/g, ' ') + ggufHeaderTag;
+
+    await handleImportModel({
+      name: cleanDisplayName,
+      filename: file.name.endsWith('.gguf') ? file.name : `${file.name}.gguf`,
+      architecture: inferredArch,
+      parametersBillions: inferredParams,
+      quantization: inferredQuant,
+      fileSizeMb: sizeMb,
+      maxNativeContext: 32768,
+      replaceStubs,
+      storagePath: `/storage/emulated/0/Download/${file.name}`,
+    });
+  };
+
+  const handleRemoveModel = async (modelId: string) => {
+    try {
+      const res = await fetch('/api/engine/models/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId }),
       });
       if (res.ok) {
         await fetchEngineState();
@@ -153,6 +240,58 @@ export default function App() {
       await fetch('/api/engine/clear-logs', { method: 'POST' });
     } catch {
       // ignore
+    }
+  };
+
+  const handleRunSelfApiTest = async () => {
+    setSelfApiTestLoading(true);
+    const t0 = Date.now();
+    try {
+      const res = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${runtimeConfig.bearerToken}`,
+          'X-Client-Agent': 'PocketGGUF-Self-API-Test',
+          'X-Client-IP': '127.0.0.1',
+        },
+        body: JSON.stringify({
+          model: activeModel.id,
+          messages: [
+            {
+              role: 'user',
+              content:
+                'Self-test diagnostic: confirm GGUF model readiness and active single-slot optimizations.',
+            },
+          ],
+          async_hold: false,
+          hold_mutex_ms: 120,
+        }),
+      });
+
+      const latencyMs = Math.max(1, Date.now() - t0);
+      const data = await res.json();
+      const answerText =
+        data?.choices?.[0]?.message?.content ||
+        data?.error?.message ||
+        JSON.stringify(data, null, 2);
+
+      setSelfApiTestResult({
+        status: res.status,
+        modelId: activeModel.id,
+        answer: answerText,
+        latencyMs,
+      });
+      await fetchEngineState();
+    } catch (err) {
+      setSelfApiTestResult({
+        status: 500,
+        modelId: activeModel.id,
+        answer: String(err),
+        latencyMs: Math.max(1, Date.now() - t0),
+      });
+    } finally {
+      setSelfApiTestLoading(false);
     }
   };
 
@@ -326,8 +465,12 @@ export default function App() {
             batteryLevelPercent={batteryLevelPercent}
             stats={stats}
             telemetryHistory={telemetryHistory}
+            selfApiTestLoading={selfApiTestLoading}
+            selfApiTestResult={selfApiTestResult}
             onToggleServer={handleToggleServer}
             onReleaseMutex={handleReleaseMutex}
+            onRunSelfApiTest={handleRunSelfApiTest}
+            onSelectLocalGgufFile={handleSelectLocalGgufFile}
             onTriggerTestConnection={(clientAgent, holdMs) => {
               handleFireApiProbe({
                 endpoint: '/v1/chat/completions',
@@ -343,8 +486,17 @@ export default function App() {
           <ModelVaultPanel
             models={models}
             activeModelId={runtimeConfig.activeModelId}
+            serverRunning={serverRunning}
             runtimeConfig={runtimeConfig}
-            onSelectModel={(modelId) => handleUpdateConfig({ activeModelId: modelId })}
+            selfApiTestLoading={selfApiTestLoading}
+            selfApiTestResult={selfApiTestResult}
+            onSelectModel={(modelId) => {
+              navigator.clipboard?.writeText(modelId).catch(() => {});
+              handleUpdateConfig({ activeModelId: modelId });
+            }}
+            onRunSelfApiTest={handleRunSelfApiTest}
+            onSelectLocalGgufFile={handleSelectLocalGgufFile}
+            onRemoveModel={handleRemoveModel}
             onImportModel={handleImportModel}
           />
         )}

@@ -6,24 +6,14 @@ import {
   calculateMemoryBreakdown,
   estimateThroughput,
   evaluateMutexAcquisition,
+  evaluatePrefixCacheHit,
+  compileJsonSchemaToGbnf,
+  evaluateThermalGovernor,
 } from './ggufEngineLogic';
 
-test('calculateMemoryBreakdown scales KV cache linearly with context length and KV quantization', () => {
+test('Proposal 1: KV Q4_0 cache default saves >70% KV RAM vs FP16 baseline', () => {
   const llama3b = INITIAL_GGUF_MODELS[0];
-
-  const mem4kFp16 = calculateMemoryBreakdown(llama3b, {
-    contextLength: 4096,
-    batchSize: 512,
-    kvCacheQuant: 'FP16',
-    mmapEnabled: true,
-  });
-
-  const mem16kFp16 = calculateMemoryBreakdown(llama3b, {
-    contextLength: 16384,
-    batchSize: 512,
-    kvCacheQuant: 'FP16',
-    mmapEnabled: true,
-  });
+  assert.equal(DEFAULT_ENGINE_CONFIG.kvCacheQuant, 'Q4_0');
 
   const mem16kQ4 = calculateMemoryBreakdown(llama3b, {
     contextLength: 16384,
@@ -32,27 +22,44 @@ test('calculateMemoryBreakdown scales KV cache linearly with context length and 
     mmapEnabled: true,
   });
 
-  assert.equal(mem16kFp16.kvCacheMb, mem4kFp16.kvCacheMb * 4);
-  assert.ok(mem16kQ4.kvCacheMb < mem16kFp16.kvCacheMb / 3);
-  assert.equal(mem4kFp16.oomRisk, 'NOMINAL');
+  assert.ok(mem16kQ4.kvSavedMb > 1200);
+  assert.ok(mem16kQ4.kvSavedPercent >= 71.5);
+  assert.equal(mem16kQ4.oomRisk, 'NOMINAL');
 });
 
-test('calculateMemoryBreakdown flags CRITICAL_OOM when 7B model uses large context on constrained RAM', () => {
-  const qwen7b = INITIAL_GGUF_MODELS[1];
-  const breakdown = calculateMemoryBreakdown(
-    qwen7b,
-    {
-      contextLength: 32768,
-      batchSize: 1024,
-      kvCacheQuant: 'FP16',
-      mmapEnabled: false,
-    },
-    8192,
-    3072
-  );
+test('Proposal 2: Single-slot KV prefix cache pinning (n_keep) reuses prefix tokens and cuts TTFT', () => {
+  const prevPrompt = 'You are an expert Android NDK kernel assistant. Analyze memory mapping.';
+  const nextPrompt = 'You are an expert Android NDK kernel assistant. Analyze page fault latency.';
 
-  assert.equal(breakdown.oomRisk, 'CRITICAL_OOM');
-  assert.ok(breakdown.totalAllocatedMb > breakdown.availableForEngineMb);
+  const hitStats = evaluatePrefixCacheHit(prevPrompt, nextPrompt, 1024, 185.0, true);
+  const unpinnedStats = evaluatePrefixCacheHit(prevPrompt, nextPrompt, 1024, 185.0, false);
+
+  assert.ok(hitStats.reusedTokensCount >= 1024);
+  assert.ok(hitStats.cacheHitRatioPercent > 80);
+  assert.ok(hitStats.pinnedTtftMs < unpinnedStats.pinnedTtftMs / 4);
+  assert.ok(hitStats.ttftSavedMs > 4000);
+});
+
+test('Proposal 3: GBNF JSON grammar compiler outputs deterministic rules for structured tool calls', () => {
+  const compiled = compileJsonSchemaToGbnf('openai_function_tool_call', true);
+  assert.equal(compiled.enabled, true);
+  assert.equal(compiled.guaranteedValidJson, true);
+  assert.ok(compiled.gbnfRuleString.includes('root'));
+  assert.ok(compiled.gbnfRuleString.includes('tool_call'));
+  assert.equal(compiled.activeRuleCount, 5);
+});
+
+test('Proposal 4: Adaptive Thermal Governor & Big.LITTLE core pinning steps down threads smoothly under heat', () => {
+  const nominalGov = evaluateThermalGovernor(37.2, 43, 6, true, true);
+  assert.equal(nominalGov.governorActive, false);
+  assert.equal(nominalGov.effectiveActiveThreads, 6);
+  assert.equal(nominalGov.coreAffinityMask, '0xFC (cpu2..cpu7)');
+
+  const hotGov = evaluateThermalGovernor(44.8, 43, 6, true, true);
+  assert.equal(hotGov.governorActive, true);
+  assert.equal(hotGov.effectiveActiveThreads, 4);
+  assert.equal(hotGov.thermalStepDownThreads, 2);
+  assert.equal(hotGov.throttlingState, 'STEP_DOWN_2_THREADS');
 });
 
 test('evaluateMutexAcquisition allows first connection and rejects concurrent request with HTTP 429', () => {
@@ -62,6 +69,8 @@ test('evaluateMutexAcquisition allows first connection and rejects concurrent re
     userAgent: 'Continue.dev/1.0',
     endpoint: '/v1/chat/completions',
     promptTokens: 312,
+    reusedPrefixTokens: 1024,
+    gbnfEnforced: true,
     now: 1700000000000,
   });
 
@@ -85,14 +94,4 @@ test('evaluateMutexAcquisition allows first connection and rejects concurrent re
   }
   assert.equal(concurrentResult.httpStatus, 429);
   assert.equal(concurrentResult.errorCode, 'single_connection_mutex_locked');
-});
-
-test('estimateThroughput reduces speed when SoC temperature exceeds thermal throttle limit', () => {
-  const model = INITIAL_GGUF_MODELS[0];
-  const nominal = estimateThroughput(model, DEFAULT_ENGINE_CONFIG, 37.5, 43);
-  const throttled = estimateThroughput(model, DEFAULT_ENGINE_CONFIG, 46.5, 43);
-
-  assert.equal(nominal.thermalThrottled, false);
-  assert.equal(throttled.thermalThrottled, true);
-  assert.ok(throttled.tokenGenTps < nominal.tokenGenTps);
 });

@@ -9,6 +9,8 @@ import {
   calculateMemoryBreakdown,
   estimateThroughput,
   evaluateMutexAcquisition,
+  evaluatePrefixCacheHit,
+  compileJsonSchemaToGbnf,
   type GgufModelSpec,
   type EngineRuntimeConfig,
   type ActiveConnectionLease,
@@ -25,6 +27,8 @@ let models: GgufModelSpec[] = [...INITIAL_GGUF_MODELS];
 let runtimeConfig: EngineRuntimeConfig = { ...DEFAULT_ENGINE_CONFIG };
 let activeLease: ActiveConnectionLease | null = null;
 let leaseTimer: ReturnType<typeof setTimeout> | null = null;
+let lastPinnedPrompt =
+  'You are an offline Android local GGUF coding and architecture assistant running via single-slot OpenAI API.';
 
 let socTempC = 37.4;
 let batteryLevelPercent = 86;
@@ -603,6 +607,8 @@ async function startServer() {
       quantization,
       fileSizeMb,
       maxNativeContext,
+      replaceStubs,
+      storagePath,
     } = req.body;
 
     if (!filename || !name) {
@@ -610,17 +616,33 @@ async function startServer() {
       return;
     }
 
-    const cleanFile = filename.endsWith('.gguf') ? filename : `${filename}.gguf`;
-    const id = cleanFile
+    const cleanFile = filename.toLowerCase().endsWith('.gguf') ? filename : `${filename}.gguf`;
+    const baseId = cleanFile
+      .replace(/\.gguf$/i, '')
       .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-|-$/g, '') || 'custom-local-gguf';
+
+    if (replaceStubs) {
+      const stubIds = new Set(INITIAL_GGUF_MODELS.map((m) => m.id));
+      for (let i = models.length - 1; i >= 0; i--) {
+        if (stubIds.has(models[i].id) && models.length > 1) {
+          models.splice(i, 1);
+        }
+      }
+    }
+
+    // Deduplicate if same baseId already exists
+    const existingIdx = models.findIndex((m) => m.id === baseId);
+    if (existingIdx !== -1) {
+      models.splice(existingIdx, 1);
+    }
 
     const paramsNum = Number(parametersBillions) || 3.0;
     const sizeNum = Number(fileSizeMb) || Math.round(paramsNum * 650);
 
     const newModel: GgufModelSpec = {
-      id: `${id}-${Date.now().toString().slice(-3)}`,
+      id: baseId,
       name: String(name).trim(),
       filename: cleanFile,
       architecture: architecture || 'llama',
@@ -634,10 +656,19 @@ async function startServer() {
       maxNativeContext: Number(maxNativeContext) || 32768,
       recommendedContext: 8192,
       sha256Prefix: Math.random().toString(16).substring(2, 14),
-      storagePath: `/storage/emulated/0/Documents/GGUF/${cleanFile}`,
+      storagePath: storagePath || `/storage/emulated/0/Download/${cleanFile}`,
       basePromptEvalTps: Math.max(60, Math.round(290 / Math.sqrt(paramsNum))),
       baseTokenGenTps: Math.max(9, Math.round((52 / Math.sqrt(paramsNum)) * 10) / 10),
     };
+
+    if (replaceStubs) {
+      const stubIds = new Set(INITIAL_GGUF_MODELS.map((m) => m.id));
+      for (let i = models.length - 1; i >= 0; i--) {
+        if (stubIds.has(models[i].id)) {
+          models.splice(i, 1);
+        }
+      }
+    }
 
     models.unshift(newModel);
     runtimeConfig.activeModelId = newModel.id;
@@ -647,6 +678,32 @@ async function startServer() {
       model: newModel,
       models,
       runtimeConfig,
+    });
+  });
+
+  app.post('/api/engine/models/remove', (req, res) => {
+    const { modelId, clearAllStubs } = req.body || {};
+    if (clearAllStubs) {
+      const stubIds = new Set(INITIAL_GGUF_MODELS.map((m) => m.id));
+      for (let i = models.length - 1; i >= 0; i--) {
+        if (stubIds.has(models[i].id) && models.length > 1) {
+          models.splice(i, 1);
+        }
+      }
+    } else if (modelId && models.length > 1) {
+      const idx = models.findIndex((m) => m.id === modelId);
+      if (idx !== -1) {
+        models.splice(idx, 1);
+      }
+    }
+    if (!models.some((m) => m.id === runtimeConfig.activeModelId) && models.length > 0) {
+      runtimeConfig.activeModelId = models[0].id;
+    }
+    recordTelemetryTick();
+    res.json({
+      models,
+      runtimeConfig,
+      activeModel: getActiveModel(),
     });
   });
 

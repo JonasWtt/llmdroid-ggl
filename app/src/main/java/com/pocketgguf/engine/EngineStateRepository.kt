@@ -15,7 +15,10 @@ data class GgufModelInfo(
     val layers: Int = 28,
     val kvHeads: Int = 8,
     val headDim: Int = 128,
-    val maxContext: Int = 32768
+    val maxContext: Int = 32768,
+    val ggufVersion: Int = 3,
+    val tensorCount: Long = 291L,
+    val headerVerified: Boolean = true
 )
 
 data class ApiAuditRecord(
@@ -28,7 +31,27 @@ data class ApiAuditRecord(
     val reason: String,
     val promptTokens: Int,
     val completionTokens: Int,
-    val tokPerSec: Double
+    val tokPerSec: Double,
+    val reusedPrefixTokens: Int = 0,
+    val gbnfApplied: Boolean = false
+)
+
+/**
+ * Sentinel placeholder used ONLY when the user has not yet picked a .gguf file from phone storage.
+ * No fake model stubs are pre-populated in availableModels.
+ */
+val UNMOUNTED_PLACEHOLDER_MODEL = GgufModelInfo(
+    id = "no-gguf-selected",
+    name = "No .GGUF Model Selected",
+    filename = "Tap 'Select .GGUF File' to pick a model from your phone",
+    uriString = "",
+    sizeMb = 0,
+    quantization = "NONE",
+    layers = 28,
+    kvHeads = 8,
+    headDim = 128,
+    maxContext = 32768,
+    headerVerified = false
 )
 
 data class EngineTelemetryState(
@@ -36,12 +59,24 @@ data class EngineTelemetryState(
     val bindAddress: String = "127.0.0.1",
     val port: Int = 8080,
     val bearerToken: String = "sk-local-gguf-android",
-    val activeModel: GgufModelInfo = DEFAULT_MODELS.first(),
-    val availableModels: List<GgufModelInfo> = DEFAULT_MODELS,
-    val contextLength: Int = 4096,
+    val activeModel: GgufModelInfo = UNMOUNTED_PLACEHOLDER_MODEL,
+    val availableModels: List<GgufModelInfo> = emptyList(),
+    val contextLength: Int = 8192,
     val batchSize: Int = 512,
     val cpuThreads: Int = 6,
-    val kvCacheQuant: String = "FP16",
+    // Proposal 1: KV Q4_0 Quantization Cache default (GGML_TYPE_Q4_0 = 0.5625 bytes/elem)
+    val kvCacheQuant: String = "Q4_0",
+    // Proposal 2: Single-Slot KV Prefix Cache Pinning (n_keep)
+    val prefixCachePinningEnabled: Boolean = true,
+    val pinnedSystemTokens: Int = 1024,
+    val lastReusedPrefixTokens: Int = 1024,
+    // Proposal 3: GBNF Grammar & JSON Schema Enforcement
+    val gbnfJsonGrammarEnabled: Boolean = true,
+    val activeGbnfSchemaName: String = "openai_function_tool_call",
+    // Proposal 4: Adaptive Thermal Governor & Big.LITTLE Core Pinning
+    val adaptiveThermalGovernorEnabled: Boolean = true,
+    val bigLittleCorePinning: Boolean = true,
+    val thermalThrottleLimitC: Double = 43.0,
     val mmapEnabled: Boolean = true,
     val wakeLockEnabled: Boolean = true,
     val activeLeaseId: String? = null,
@@ -53,60 +88,57 @@ data class EngineTelemetryState(
     val socTempC: Double = 36.8,
     val auditLogs: List<ApiAuditRecord> = emptyList()
 ) {
+    val hasValidModelMounted: Boolean
+        get() = activeModel.uriString.isNotBlank() && activeModel.id != UNMOUNTED_PLACEHOLDER_MODEL.id
+
     val kvCacheMb: Int
         get() {
+            if (!hasValidModelMounted) return 0
             val bytesPerElement = when (kvCacheQuant) {
-                "Q8_0" -> 1.0625
                 "Q4_0" -> 0.5625
+                "Q8_0" -> 1.0625
                 else -> 2.0
             }
             val bytes = 2.0 * activeModel.layers * activeModel.kvHeads * activeModel.headDim * contextLength * bytesPerElement
             return (bytes / (1024.0 * 1024.0)).toInt()
         }
 
+    val fp16BaselineKvMb: Int
+        get() {
+            if (!hasValidModelMounted) return 0
+            val bytes = 2.0 * activeModel.layers * activeModel.kvHeads * activeModel.headDim * contextLength * 2.0
+            return (bytes / (1024.0 * 1024.0)).toInt()
+        }
+
+    val kvSavedMb: Int
+        get() = (fp16BaselineKvMb - kvCacheMb).coerceAtLeast(0)
+
+    val effectiveActiveThreads: Int
+        get() {
+            if (!adaptiveThermalGovernorEnabled) return cpuThreads
+            val delta = socTempC - thermalThrottleLimitC
+            val stepDown = when {
+                delta >= 3.0 -> 3
+                delta >= 1.0 -> 2
+                delta >= -0.8 -> 1
+                else -> 0
+            }
+            return (cpuThreads - stepDown).coerceAtLeast(2)
+        }
+
+    val coreAffinityMaskHex: String
+        get() = if (bigLittleCorePinning) "0xFC (cpu2..cpu7 Prime+Perf)" else "0xFF (All Cores)"
+
     val totalAllocatedMb: Int
         get() {
+            if (!hasValidModelMounted) return 0
             val weights = if (mmapEnabled) (activeModel.sizeMb * 0.94).toInt() else activeModel.sizeMb
             val scratch = 96 + (batchSize / 4)
             return weights + kvCacheMb + scratch
         }
 }
 
-val DEFAULT_MODELS = listOf(
-    GgufModelInfo(
-        id = "llama-3.2-3b-q4_k_m",
-        name = "Llama 3.2 3B Instruct",
-        filename = "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        uriString = "/storage/emulated/0/Documents/GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        sizeMb = 2020,
-        quantization = "Q4_K_M"
-    ),
-    GgufModelInfo(
-        id = "qwen-2.5-coder-7b-q4_k_m",
-        name = "Qwen 2.5 Coder 7B Instruct",
-        filename = "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-        uriString = "/storage/emulated/0/Documents/GGUF/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-        sizeMb = 4680,
-        quantization = "Q4_K_M",
-        kvHeads = 4
-    ),
-    GgufModelInfo(
-        id = "deepseek-r1-distill-qwen-1.5b-q5_k_m",
-        name = "DeepSeek R1 Distill 1.5B",
-        filename = "DeepSeek-R1-Distill-Qwen-1.5B-Q5_K_M.gguf",
-        uriString = "/storage/emulated/0/Documents/GGUF/DeepSeek-R1-Distill-Qwen-1.5B-Q5_K_M.gguf",
-        sizeMb = 1310,
-        quantization = "Q5_K_M",
-        kvHeads = 2
-    )
-)
-
-/**
- * Thread-safe singleton state holder shared between MainActivity (Compose UI)
- * and GgufServerService (Background Single-Connection OpenAI HTTP Daemon).
- */
 object EngineStateRepository {
-    // Non-blocking atomic mutex enforcing max_connections = 1 across the OpenAI HTTP server
     val singleConnectionMutex = AtomicBoolean(false)
 
     private val _state = MutableStateFlow(EngineTelemetryState())

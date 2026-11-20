@@ -29,7 +29,19 @@ export interface EngineRuntimeConfig {
   batchSize: number;
   cpuThreads: number;
   gpuLayers: number;
+  // Proposal 1: KV Q4_0 Quantization Cache
   kvCacheQuant: KvCacheQuantType;
+  // Proposal 2: Single-Slot KV Prefix Cache Pinning (n_keep)
+  prefixCachePinningEnabled: boolean;
+  pinnedSystemTokens: number;
+  // Proposal 3: GBNF Grammar & JSON Schema Enforcement
+  gbnfJsonGrammarEnabled: boolean;
+  activeGbnfSchemaName: string;
+  // Proposal 4: Adaptive Thermal Governor & Big.LITTLE Core Pinning
+  adaptiveThermalGovernorEnabled: boolean;
+  bigLittleCorePinning: boolean;
+  thermalThrottleLimitC: number;
+  // Standard flags
   mmapEnabled: boolean;
   mlockEnabled: boolean;
   flashAttention: boolean;
@@ -40,13 +52,15 @@ export interface EngineRuntimeConfig {
   airplaneOfflineEnforced: boolean;
   wakeLockEnabled: boolean;
   autoUnloadIdleMinutes: number;
-  thermalThrottleLimitC: number;
   backend: ExecutionBackend;
 }
 
 export interface MemoryBreakdown {
   weightsMb: number;
   kvCacheMb: number;
+  fp16BaselineKvMb: number;
+  kvSavedMb: number;
+  kvSavedPercent: number;
   computeBufferMb: number;
   totalAllocatedMb: number;
   deviceRamTotalMb: number;
@@ -54,6 +68,34 @@ export interface MemoryBreakdown {
   availableForEngineMb: number;
   utilizationPercent: number;
   oomRisk: 'NOMINAL' | 'ELEVATED' | 'CRITICAL_OOM';
+}
+
+export interface PrefixCacheStats {
+  pinnedPrefixTokens: number;
+  reusedTokensCount: number;
+  newTokensEvaluated: number;
+  cacheHitRatioPercent: number;
+  unpinnedTtftMs: number;
+  pinnedTtftMs: number;
+  ttftSavedMs: number;
+}
+
+export interface GbnfGrammarCompilation {
+  enabled: boolean;
+  schemaName: string;
+  gbnfRuleString: string;
+  activeRuleCount: number;
+  guaranteedValidJson: boolean;
+}
+
+export interface ThermalGovernorStatus {
+  governorActive: boolean;
+  coreAffinityMask: string;
+  coreTopologyLabel: string;
+  configuredThreads: number;
+  effectiveActiveThreads: number;
+  thermalStepDownThreads: number;
+  throttlingState: 'PRIME_PERF_LOCKED' | 'STEP_DOWN_1_THREAD' | 'STEP_DOWN_2_THREADS' | 'THERMAL_GUARD_CLAMP';
 }
 
 export interface TelemetrySample {
@@ -64,6 +106,7 @@ export interface TelemetrySample {
   socTempC: number;
   batteryDrainWatts: number;
   cpuLoadPercent: number;
+  effectiveThreads?: number;
 }
 
 export interface ActiveConnectionLease {
@@ -74,6 +117,8 @@ export interface ActiveConnectionLease {
   acquiredAt: number;
   promptTokens: number;
   generatedTokens: number;
+  reusedPrefixTokens?: number;
+  gbnfEnforced?: boolean;
   status: 'EVALUATING_PROMPT' | 'STREAMING_TOKENS';
 }
 
@@ -90,6 +135,8 @@ export interface ApiAuditEntry {
   completionTokens: number;
   latencyMs: number;
   tokensPerSec: number;
+  reusedPrefixTokens?: number;
+  gbnfSchemaApplied?: string;
 }
 
 export const INITIAL_GGUF_MODELS: GgufModelSpec[] = [
@@ -190,13 +237,26 @@ export const INITIAL_GGUF_MODELS: GgufModelSpec[] = [
   },
 ];
 
+// Proposal 1..4 all enabled by default in DEFAULT_ENGINE_CONFIG
 export const DEFAULT_ENGINE_CONFIG: EngineRuntimeConfig = {
   activeModelId: 'llama-3.2-3b-q4_k_m',
-  contextLength: 4096,
+  contextLength: 8192,
   batchSize: 512,
   cpuThreads: 6,
   gpuLayers: 28,
-  kvCacheQuant: 'FP16',
+  // 1. KV Q4_0 Quantization Cache default
+  kvCacheQuant: 'Q4_0',
+  // 2. Single-Slot KV Prefix Cache Pinning (n_keep)
+  prefixCachePinningEnabled: true,
+  pinnedSystemTokens: 1024,
+  // 3. GBNF Grammar & JSON Schema Enforcement
+  gbnfJsonGrammarEnabled: true,
+  activeGbnfSchemaName: 'openai_function_tool_call',
+  // 4. Adaptive Thermal Governor & Big.LITTLE Core Pinning
+  adaptiveThermalGovernorEnabled: true,
+  bigLittleCorePinning: true,
+  thermalThrottleLimitC: 43,
+  // Standard flags
   mmapEnabled: true,
   mlockEnabled: false,
   flashAttention: true,
@@ -207,12 +267,11 @@ export const DEFAULT_ENGINE_CONFIG: EngineRuntimeConfig = {
   airplaneOfflineEnforced: true,
   wakeLockEnabled: true,
   autoUnloadIdleMinutes: 10,
-  thermalThrottleLimitC: 43,
   backend: 'Vulkan 1.3 (Adreno / Mali)',
 };
 
 /**
- * Bytes per element in KV cache based on quantization format
+ * Proposal 1: Bytes per element in KV cache based on quantization format (GGML_TYPE_Q4_0 = 0.5625 bytes/elem)
  */
 export function getKvBytesPerElement(quant: KvCacheQuantType): number {
   switch (quant) {
@@ -226,8 +285,7 @@ export function getKvBytesPerElement(quant: KvCacheQuantType): number {
 }
 
 /**
- * Calculates exact GGUF memory footprint (Weights + KV Cache + Compute Buffers)
- * KV Cache bytes = 2 (K & V) * numLayers * numKvHeads * headDim * contextLength * bytesPerElement
+ * Proposal 1: Calculates exact GGUF memory footprint including Q4_0 KV Cache savings vs FP16 baseline
  */
 export function calculateMemoryBreakdown(
   model: GgufModelSpec,
@@ -245,12 +303,24 @@ export function calculateMemoryBreakdown(
     bytesPerElem;
   const kvCacheMb = Math.round(kvBytes / (1024 * 1024));
 
-  // Compute buffer scales with batch size and hidden dimension
+  const fp16Bytes =
+    2 *
+    model.numLayers *
+    model.numKvHeads *
+    model.headDim *
+    config.contextLength *
+    2.0;
+  const fp16BaselineKvMb = Math.round(fp16Bytes / (1024 * 1024));
+  const kvSavedMb = Math.max(0, fp16BaselineKvMb - kvCacheMb);
+  const kvSavedPercent =
+    fp16BaselineKvMb > 0
+      ? Math.round((kvSavedMb / fp16BaselineKvMb) * 1000) / 10
+      : 0;
+
   const computeBufferMb = Math.round(
     85 + (config.batchSize / 512) * (model.hiddenSize / 2048) * 64
   );
 
-  // If mmap is enabled, resident weights in physical RAM are slightly lower initially (~92%), else 100%
   const weightsMb = config.mmapEnabled
     ? Math.round(model.fileSizeMb * 0.94)
     : model.fileSizeMb;
@@ -272,6 +342,9 @@ export function calculateMemoryBreakdown(
   return {
     weightsMb,
     kvCacheMb,
+    fp16BaselineKvMb,
+    kvSavedMb,
+    kvSavedPercent,
     computeBufferMb,
     totalAllocatedMb,
     deviceRamTotalMb,
@@ -283,15 +356,217 @@ export function calculateMemoryBreakdown(
 }
 
 /**
- * Calculates realistic token throughput based on context length, threads, thermal state, and backend
+ * Proposal 2: Single-Slot KV Prefix Cache Pinning (n_keep)
+ * Calculates longest common token prefix hit and Time-To-First-Token (TTFT) reduction.
+ */
+export function evaluatePrefixCacheHit(
+  previousPinnedPrompt: string,
+  incomingPrompt: string,
+  pinnedSystemTokens: number,
+  promptEvalTps: number,
+  pinningEnabled: boolean
+): PrefixCacheStats {
+  const totalIncomingTokens = Math.max(
+    48,
+    Math.round(incomingPrompt.length / 3.5) + pinnedSystemTokens
+  );
+  const safeEvalTps = Math.max(20, promptEvalTps);
+  const unpinnedTtftMs = Math.round((totalIncomingTokens / safeEvalTps) * 1000);
+
+  if (!pinningEnabled) {
+    return {
+      pinnedPrefixTokens: 0,
+      reusedTokensCount: 0,
+      newTokensEvaluated: totalIncomingTokens,
+      cacheHitRatioPercent: 0,
+      unpinnedTtftMs,
+      pinnedTtftMs: unpinnedTtftMs,
+      ttftSavedMs: 0,
+    };
+  }
+
+  // Compute common character prefix between previous and incoming prompt
+  let commonChars = 0;
+  const minLen = Math.min(previousPinnedPrompt.length, incomingPrompt.length);
+  while (
+    commonChars < minLen &&
+    previousPinnedPrompt.charCodeAt(commonChars) === incomingPrompt.charCodeAt(commonChars)
+  ) {
+    commonChars++;
+  }
+
+  const dynamicPrefixTokens = Math.round(commonChars / 3.5);
+  const reusedTokensCount = Math.min(
+    totalIncomingTokens - 12,
+    pinnedSystemTokens + dynamicPrefixTokens
+  );
+  const newTokensEvaluated = Math.max(12, totalIncomingTokens - reusedTokensCount);
+  const cacheHitRatioPercent =
+    Math.round((reusedTokensCount / totalIncomingTokens) * 1000) / 10;
+
+  const pinnedTtftMs = Math.max(
+    35,
+    Math.round((newTokensEvaluated / safeEvalTps) * 1000)
+  );
+
+  return {
+    pinnedPrefixTokens: pinnedSystemTokens,
+    reusedTokensCount,
+    newTokensEvaluated,
+    cacheHitRatioPercent,
+    unpinnedTtftMs,
+    pinnedTtftMs,
+    ttftSavedMs: Math.max(0, unpinnedTtftMs - pinnedTtftMs),
+  };
+}
+
+/**
+ * Proposal 3: Zero-Overhead GBNF Grammar & JSON Schema Compiler
+ * Compiles OpenAI response_format / function schemas into llama.cpp GBNF state machine rules.
+ */
+export function compileJsonSchemaToGbnf(
+  schemaName: string,
+  enabled: boolean
+): GbnfGrammarCompilation {
+  if (!enabled) {
+    return {
+      enabled: false,
+      schemaName: 'unconstrained_free_text',
+      gbnfRuleString: '# GBNF logit masking disabled (free-form sampling)',
+      activeRuleCount: 0,
+      guaranteedValidJson: false,
+    };
+  }
+
+  if (schemaName === 'rag_citation_payload') {
+    const gbnf = [
+      'root   ::= "{" ws "\\"answer\\":" ws string "," ws "\\"confidence\\":" ws number "," ws "\\"citations\\":" ws "[" ws string ("," ws string)* ws "]" ws "}"',
+      'string ::= "\\"" ([^"\\\\\\x7F\\x00-\\x1F] | "\\\\" ["\\\\bfnrt])* "\\""',
+      'number ::= ("0" | "1" | "0." [0-9]{1,3})',
+      'ws     ::= [ \\t\\n]*',
+    ].join('\n');
+    return {
+      enabled: true,
+      schemaName,
+      gbnfRuleString: gbnf,
+      activeRuleCount: 4,
+      guaranteedValidJson: true,
+    };
+  }
+
+  // Default: openai_function_tool_call
+  const gbnf = [
+    'root      ::= "{" ws "\\"tool_call\\":" ws tool "," ws "\\"arguments\\":" ws args "," ws "\\"status\\":" ws "\\"ok\\"" ws "}"',
+    'tool      ::= "\\"execute_local_action\\"" | "\\"query_local_index\\"" | "\\"apply_code_patch\\""',
+    'args      ::= "{" ws "\\"target\\":" ws string "," ws "\\"strict_local\\":" ws ("true" | "false") ws "}"',
+    'string    ::= "\\"" ([^"\\\\\\x7F\\x00-\\x1F] | "\\\\" ["\\\\bfnrt])* "\\""',
+    'ws        ::= [ \\t\\n]*',
+  ].join('\n');
+
+  return {
+    enabled: true,
+    schemaName: 'openai_function_tool_call',
+    gbnfRuleString: gbnf,
+    activeRuleCount: 5,
+    guaranteedValidJson: true,
+  };
+}
+
+/**
+ * Proposal 4: Adaptive Thermal Governor & Big.LITTLE Core Pinning
+ * Calculates CPU core affinity mask (Prime Cortex-X4 + Perf Cortex-A720) and dynamic thread step-down.
+ */
+export function evaluateThermalGovernor(
+  socTempC: number,
+  thermalLimitC: number,
+  configuredThreads: number,
+  governorEnabled: boolean,
+  bigLittlePinningEnabled: boolean
+): ThermalGovernorStatus {
+  // Mask cores 2..7 (Performance A720 + Prime X4), excluding Efficiency A520 cores 0..1
+  const coreAffinityMask = bigLittlePinningEnabled ? '0xFC (cpu2..cpu7)' : '0xFF (cpu0..cpu7 All)';
+  const coreTopologyLabel = bigLittlePinningEnabled
+    ? '1x Cortex-X4 Prime + 5x Cortex-A720 Perf (E-Cores Excluded)'
+    : 'Unpinned (OS Scheduler Default)';
+
+  if (!governorEnabled) {
+    return {
+      governorActive: false,
+      coreAffinityMask,
+      coreTopologyLabel,
+      configuredThreads,
+      effectiveActiveThreads: configuredThreads,
+      thermalStepDownThreads: 0,
+      throttlingState: 'PRIME_PERF_LOCKED',
+    };
+  }
+
+  const deltaC = socTempC - thermalLimitC;
+  let stepDown = 0;
+  let throttlingState: ThermalGovernorStatus['throttlingState'] = 'PRIME_PERF_LOCKED';
+
+  if (deltaC >= 3.0) {
+    stepDown = Math.min(configuredThreads - 2, 3);
+    throttlingState = 'THERMAL_GUARD_CLAMP';
+  } else if (deltaC >= 1.0) {
+    stepDown = Math.min(configuredThreads - 2, 2);
+    throttlingState = 'STEP_DOWN_2_THREADS';
+  } else if (deltaC >= -0.8) {
+    stepDown = Math.min(configuredThreads - 2, 1);
+    throttlingState = 'STEP_DOWN_1_THREAD';
+  }
+
+  stepDown = Math.max(0, stepDown);
+  const effectiveActiveThreads = Math.max(2, configuredThreads - stepDown);
+
+  return {
+    governorActive: stepDown > 0,
+    coreAffinityMask,
+    coreTopologyLabel,
+    configuredThreads,
+    effectiveActiveThreads,
+    thermalStepDownThreads: stepDown,
+    throttlingState,
+  };
+}
+
+/**
+ * Calculates realistic token throughput factoring in Proposals 1-4
  */
 export function estimateThroughput(
   model: GgufModelSpec,
-  config: Pick<EngineRuntimeConfig, 'contextLength' | 'cpuThreads' | 'backend' | 'flashAttention'>,
+  config: Pick<
+    EngineRuntimeConfig,
+    | 'contextLength'
+    | 'cpuThreads'
+    | 'backend'
+    | 'flashAttention'
+    | 'adaptiveThermalGovernorEnabled'
+    | 'bigLittleCorePinning'
+    | 'thermalThrottleLimitC'
+  >,
   socTempC: number,
   thermalLimitC: number
-): { promptEvalTps: number; tokenGenTps: number; thermalThrottled: boolean } {
-  const threadFactor = Math.min(1.25, 0.55 + config.cpuThreads * 0.11);
+): {
+  promptEvalTps: number;
+  tokenGenTps: number;
+  thermalThrottled: boolean;
+  governorStatus: ThermalGovernorStatus;
+} {
+  const governorStatus = evaluateThermalGovernor(
+    socTempC,
+    thermalLimitC,
+    config.cpuThreads,
+    config.adaptiveThermalGovernorEnabled ?? true,
+    config.bigLittleCorePinning ?? true
+  );
+
+  const effectiveThreads = governorStatus.effectiveActiveThreads;
+  const threadFactor = Math.min(1.25, 0.55 + effectiveThreads * 0.11);
+
+  // Pinning to Prime + Perf cores avoids Big.LITTLE barrier synchronization stalls (+12% sustained tok/s)
+  const corePinningBonus = (config.bigLittleCorePinning ?? true) ? 1.12 : 0.96;
+
   const backendMultiplier =
     config.backend === 'Qualcomm QNN (Hexagon NPU)'
       ? 1.22
@@ -299,20 +574,23 @@ export function estimateThroughput(
         ? 1.08
         : 0.78;
 
-  // Longer context slightly degrades attention speed unless flash attention is enabled
   const contextPenalty = config.flashAttention
     ? Math.max(0.78, 1 - (config.contextLength / 32768) * 0.18)
     : Math.max(0.55, 1 - (config.contextLength / 32768) * 0.42);
 
   const thermalThrottled = socTempC >= thermalLimitC;
+  // When Adaptive Thermal Governor is enabled, it gracefully steps down threads instead of suffering a 70% OS thermal cliff
   const thermalFactor = thermalThrottled
-    ? Math.max(0.48, 1 - (socTempC - thermalLimitC + 1) * 0.09)
+    ? (config.adaptiveThermalGovernorEnabled ?? true)
+      ? Math.max(0.76, 1 - (socTempC - thermalLimitC + 1) * 0.05)
+      : Math.max(0.35, 1 - (socTempC - thermalLimitC + 1) * 0.14)
     : 1.0;
 
   const promptEvalTps =
     Math.round(
       model.basePromptEvalTps *
         threadFactor *
+        corePinningBonus *
         backendMultiplier *
         contextPenalty *
         thermalFactor *
@@ -323,6 +601,7 @@ export function estimateThroughput(
     Math.round(
       model.baseTokenGenTps *
         threadFactor *
+        corePinningBonus *
         backendMultiplier *
         contextPenalty *
         thermalFactor *
@@ -333,6 +612,7 @@ export function estimateThroughput(
     promptEvalTps,
     tokenGenTps,
     thermalThrottled,
+    governorStatus,
   };
 }
 
@@ -348,11 +628,19 @@ export function evaluateMutexAcquisition(
     userAgent: string;
     endpoint: string;
     promptTokens: number;
+    reusedPrefixTokens?: number;
+    gbnfEnforced?: boolean;
     now: number;
   }
 ):
   | { allowed: true; lease: ActiveConnectionLease }
-  | { allowed: false; httpStatus: 429; errorCode: 'single_connection_mutex_locked'; message: string; activeLease: ActiveConnectionLease } {
+  | {
+      allowed: false;
+      httpStatus: 429;
+      errorCode: 'single_connection_mutex_locked';
+      message: string;
+      activeLease: ActiveConnectionLease;
+    } {
   if (currentLease !== null) {
     return {
       allowed: false,
@@ -373,6 +661,8 @@ export function evaluateMutexAcquisition(
       acquiredAt: candidate.now,
       promptTokens: candidate.promptTokens,
       generatedTokens: 0,
+      reusedPrefixTokens: candidate.reusedPrefixTokens ?? 0,
+      gbnfEnforced: candidate.gbnfEnforced ?? false,
       status: 'EVALUATING_PROMPT',
     },
   };

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import {
   Cpu,
   HardDrive,
@@ -12,6 +12,9 @@ import {
   AlertTriangle,
   WifiOff,
   Radio,
+  PauseCircle,
+  Zap,
+  FolderOpen,
 } from 'lucide-react';
 import type {
   GgufModelSpec,
@@ -36,8 +39,17 @@ interface ServerDaemonPanelProps {
     totalTokensGenerated: number;
   };
   telemetryHistory: TelemetrySample[];
+  selfApiTestLoading: boolean;
+  selfApiTestResult: {
+    status: number;
+    modelId: string;
+    answer: string;
+    latencyMs: number;
+  } | null;
   onToggleServer: () => void;
   onReleaseMutex: () => void;
+  onRunSelfApiTest: () => Promise<void>;
+  onSelectLocalGgufFile: (file: File, replaceStubs: boolean) => Promise<void>;
   onTriggerTestConnection: (clientAgent: string, holdMs: number) => void;
 }
 
@@ -52,10 +64,15 @@ export const ServerDaemonPanel: React.FC<ServerDaemonPanelProps> = ({
   batteryLevelPercent,
   stats,
   telemetryHistory,
+  selfApiTestLoading,
+  selfApiTestResult,
   onToggleServer,
   onReleaseMutex,
+  onRunSelfApiTest,
+  onSelectLocalGgufFile,
   onTriggerTestConnection,
 }) => {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const weightsPct = Math.round((memory.weightsMb / memory.availableForEngineMb) * 100);
   const kvPct = Math.round((memory.kvCacheMb / memory.availableForEngineMb) * 100);
   const computePct = Math.round((memory.computeBufferMb / memory.availableForEngineMb) * 100);
@@ -70,11 +87,36 @@ export const ServerDaemonPanel: React.FC<ServerDaemonPanelProps> = ({
           className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 flex flex-col justify-between"
         >
           <div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".gguf,*/*"
+              aria-label="Select local GGUF file from device"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  onSelectLocalGgufFile(file, true);
+                  e.target.value = '';
+                }
+              }}
+            />
+
             <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-100">
               <div>
-                <p className="text-xs font-medium text-slate-500">
-                  Android Foreground Service · Headless OpenAI Bridge
-                </p>
+                <div className="flex items-center gap-2 text-xs font-mono font-bold">
+                  {serverRunning ? (
+                    <span className="text-emerald-700 flex items-center gap-1.5">
+                      <Radio className="w-3.5 h-3.5" />
+                      MODEL ACTIVELY SERVING LIVE
+                    </span>
+                  ) : (
+                    <span className="text-amber-700 flex items-center gap-1.5">
+                      <PauseCircle className="w-3.5 h-3.5" />
+                      SERVER STOPPED (MODEL IN STANDBY)
+                    </span>
+                  )}
+                </div>
                 <h2 className="text-xl font-bold text-slate-900 mt-0.5">
                   {serverRunning
                     ? `Listening on http://${runtimeConfig.bindAddress}:${runtimeConfig.port}/v1`
@@ -82,61 +124,109 @@ export const ServerDaemonPanel: React.FC<ServerDaemonPanelProps> = ({
                 </h2>
               </div>
 
-              <button
-                type="button"
-                onClick={onToggleServer}
-                className={`min-h-[44px] px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  serverRunning
-                    ? 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'
-                    : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                }`}
-              >
-                {serverRunning ? (
-                  <>
-                    <Square className="w-3.5 h-3.5 fill-current" />
-                    Stop API Server
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3.5 h-3.5 fill-current" />
-                    Start API Server
-                  </>
-                )}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="min-h-[44px] px-3.5 py-2 rounded-lg text-xs font-semibold bg-white border border-slate-300 text-slate-900 hover:bg-slate-50 flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                  Select .GGUF File
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onRunSelfApiTest}
+                  disabled={selfApiTestLoading}
+                  className="min-h-[44px] px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  {selfApiTestLoading ? 'Testing API...' : 'Self API Functionality Test'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onToggleServer}
+                  className={`min-h-[44px] px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    serverRunning
+                      ? 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'
+                      : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                  }`}
+                >
+                  {serverRunning ? (
+                    <>
+                      <Square className="w-3.5 h-3.5 fill-current" />
+                      Stop API Server
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      Start API Server
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
             {/* Active Model & Runtime Metadata */}
             <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>
-                <span className="text-xs text-slate-500 block">Loaded GGUF Artifact</span>
+                <span className="text-xs text-slate-500 block">
+                  {serverRunning ? 'Serving GGUF Model' : 'Mounted Standby Model'}
+                </span>
                 <span className="text-sm font-semibold text-slate-900 block truncate mt-0.5">
                   {activeModel.name}
                 </span>
-                <span className="text-xs font-mono text-slate-500">
-                  {activeModel.quantization} · {(activeModel.fileSizeMb / 1024).toFixed(2)} GB
+                <span className="text-xs font-mono text-slate-600">
+                  Client ID: <strong>{activeModel.id}</strong>
                 </span>
               </div>
 
               <div>
-                <span className="text-xs text-slate-500 block">Context & KV Cache</span>
+                <span className="text-xs text-slate-500 block">Context &amp; KV Q4_0 Cache</span>
                 <span className="text-sm font-semibold font-mono tabular-nums text-slate-900 block mt-0.5">
                   {runtimeConfig.contextLength.toLocaleString()} tokens
                 </span>
-                <span className="text-xs font-mono text-slate-500">
-                  KV {runtimeConfig.kvCacheQuant} · Batch {runtimeConfig.batchSize}
+                <span className="text-xs font-mono text-emerald-700 font-semibold">
+                  KV {runtimeConfig.kvCacheQuant} (Saved {memory.kvSavedMb} MB)
                 </span>
               </div>
 
               <div>
-                <span className="text-xs text-slate-500 block">Execution Backend</span>
+                <span className="text-xs text-slate-500 block">Execution &amp; Prefix Cache</span>
                 <span className="text-sm font-semibold text-slate-900 block truncate mt-0.5">
-                  {runtimeConfig.backend.split(' ')[0]}
+                  {runtimeConfig.backend.split(' ')[0]} · Mask 0xFC
                 </span>
                 <span className="text-xs font-mono text-slate-500">
-                  {runtimeConfig.cpuThreads} Threads · {runtimeConfig.gpuLayers} GPU Layers
+                  n_keep: {runtimeConfig.pinnedSystemTokens} tok · GBNF: {runtimeConfig.gbnfJsonGrammarEnabled ? 'ON' : 'OFF'}
                 </span>
               </div>
             </div>
+
+            {/* Self API Test Output Box if triggered */}
+            {selfApiTestResult && (
+              <div
+                data-testid="daemon-self-test-result"
+                className="mt-4 p-3.5 bg-slate-900 text-slate-100 rounded-lg font-mono text-xs space-y-1"
+              >
+                <div className="flex items-center justify-between text-slate-400 border-b border-slate-800 pb-1.5">
+                  <span>Self API Test · model=&quot;{selfApiTestResult.modelId}&quot;</span>
+                  <span
+                    className={
+                      selfApiTestResult.status === 200
+                        ? 'text-emerald-400 font-bold'
+                        : 'text-amber-400 font-bold'
+                    }
+                  >
+                    HTTP {selfApiTestResult.status} ({selfApiTestResult.latencyMs} ms)
+                  </span>
+                </div>
+                <div className="text-emerald-300 font-semibold pt-1">Model Answer:</div>
+                <pre className="text-[11px] whitespace-pre-wrap break-words leading-relaxed">
+                  {selfApiTestResult.answer}
+                </pre>
+              </div>
+            )}
           </div>
 
           {/* Privacy & Offline Guarantees Row */}
